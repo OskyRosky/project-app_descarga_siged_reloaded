@@ -1,0 +1,33 @@
+# Base oficial de Playwright con navegadores (multi-arch, sirve en arm64)
+# Base Playwright con navegadores (multi-arch; sirve para Apple Silicon también)
+FROM mcr.microsoft.com/playwright/python:v1.46.0-jammy
+
+WORKDIR /app
+
+# 1) Dependencias Python
+COPY requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir -r /app/requirements.txt
+
+# Asegurar que playwright (py) está presente (la imagen ya trae browsers)
+RUN pip install --no-cache-dir "playwright==1.46.0" \
+ && python - <<'PY'
+import importlib, sys
+m = importlib.import_module("playwright")
+print("Playwright OK:", getattr(m, "__version__", "unknown"), "| Python:", sys.version)
+PY
+
+# 2) Código del backend (incluye /app/public con el build del frontend)
+COPY app /app/app
+
+# 3) Configuración de ejecución
+ENV PYTHONUNBUFFERED=1
+ENV SIGED_HEADLESS=1
+
+# 👇 IMPORTANTE: esta variable apunta al volumen montado del host
+#    El código usará SIGED_HOST_DOWNLOADS como base de descargas
+ENV SIGED_HOST_DOWNLOADS=/host_downloads
+
+EXPOSE 8000
+
+# 4) Arranque del API que también sirve el frontend estático desde /app/app/public
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]

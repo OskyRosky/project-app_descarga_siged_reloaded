@@ -1,0 +1,19 @@
+
+services:
+  backend:
+    build:
+      context: ./backend
+    container_name: siged-backend
+    ports:
+      - "8000:8000"
+    restart: always
+    volumes:
+      - ./backend/descargas:/app/descargas
+
+  frontend:
+    build:
+      context: ./frontend
+    container_name: siged-frontend
+    ports:
+      - "80:80"
+    restart: always
