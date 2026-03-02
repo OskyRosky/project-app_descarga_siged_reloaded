@@ -28,13 +28,26 @@ def _safe_filename(name: str) -> str:
 
 
 def get_job_dir(job_id: str) -> Path:
+    """Return job directory path and ensure it exists.
+
+    Env: SIGED_STORAGE_DIR
+      - In Docker: set to /data (and mount a volume if you want persistence).
+      - Running locally: if not set, default to a writable folder: <backend>/data
+
+    Final path:
+      <SIGED_STORAGE_DIR>/SIGED_DOCUMENTOS/<job_id>
     """
-    Env: SIGED_STORAGE_DIR (default: /data)
-    Ruta: <SIGED_STORAGE_DIR>/SIGED_DOCUMENTOS/<job_id>
-    """
-    base = os.getenv("SIGED_STORAGE_DIR", "/data").strip() or "/data"
-    base_path = Path(base)
-    return base_path / "SIGED_DOCUMENTOS" / job_id
+    env_base = (os.getenv("SIGED_STORAGE_DIR", "").strip() or None)
+
+    if env_base:
+        base = Path(env_base).expanduser()
+    else:
+        # default local-safe path: Mod11/backend/data
+        base = Path(__file__).resolve().parents[1] / "data"
+
+    job_dir = base / "SIGED_DOCUMENTOS" / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+    return job_dir
 
 
 def ensure_job_dir(job_id: str) -> Path:
