@@ -5,8 +5,8 @@ import unicodedata
 from pathlib import Path
 from typing import Optional, List, Tuple
 from urllib.parse import unquote, urlparse, urljoin
+from uuid import uuid4
 
-from platformdirs import user_downloads_dir
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 
 # ============================
@@ -27,8 +27,9 @@ class ProgresoDescarga:
         self.last_file: str = ""
         self.last_error: str = ""
         self.current_url: str = ""
+        self.current_job_id: str = ""
 
-    async def reset(self, url: str = "") -> None:
+    async def reset(self, url: str = "", job_id: str = "") -> None:
         async with self._lock:
             self.status = "inicio"
             self.total = 0
@@ -37,8 +38,9 @@ class ProgresoDescarga:
             self.last_file = ""
             self.last_error = ""
             self.current_url = url
+            self.current_job_id = job_id
 
-    async def start(self, url: str) -> None:
+    async def start(self, url: str, job_id: str) -> None:
         async with self._lock:
             self.status = "descargando"
             self.total = 0
@@ -47,6 +49,7 @@ class ProgresoDescarga:
             self.last_file = ""
             self.last_error = ""
             self.current_url = url
+            self.current_job_id = job_id
 
     async def set_total(self, n: int) -> None:
         async with self._lock:
@@ -76,7 +79,6 @@ class ProgresoDescarga:
             self.status = "cancelado"
 
     def to_dict(self) -> dict:
-        # Lectura sin lock por simplicidad (se actualiza en bloque bajo lock)
         return {
             "status": self.status,
             "total": self.total,
@@ -85,12 +87,17 @@ class ProgresoDescarga:
             "last_file": self.last_file,
             "last_error": self.last_error,
             "current_url": self.current_url,
+            "job_id": self.current_job_id,
         }
 
 # Instancias/globales de coordinación
 progreso = ProgresoDescarga()
 _cancel_event = asyncio.Event()
 _current_task: Optional[asyncio.Task] = None
+
+# Estado actual del job (para routes.py)
+_current_job_id: Optional[str] = None
+_current_job_dir: Optional[Path] = None
 
 # ============================
 #  Utilidades (nombres/archivos)
@@ -105,6 +112,12 @@ def _sanitize_filename(filename: str) -> str:
     if not base:
         base = "archivo"
     return f"{base}{ext}"
+
+def _sanitize_job_id(job_id: str) -> str:
+    # solo letras, números, guion y underscore
+    job_id = (job_id or "").strip()
+    job_id = re.sub(r"[^a-zA-Z0-9_-]", "", job_id)
+    return job_id or uuid4().hex[:10]
 
 def _unique_path(path: Path) -> Path:
     if not path.exists():
@@ -155,26 +168,43 @@ def _is_allowed_url(url: str) -> bool:
     except Exception:
         return False
 
-# --- base de descargas configurable ---
-def _get_download_base() -> Path:
-    base = os.getenv("SIGED_HOST_DOWNLOADS", "").strip()
-    if base:
-        return Path(base).expanduser().resolve()
-    return Path(user_downloads_dir())
+# ============================
+#  Server-side storage
+# ============================
 
-# --- helper con reintentos y timeout para HTTP GET de archivos ---
-async def _http_get_with_retry(request, url: str, *, retries: int = 2, timeout_ms: int = 30000):
-    last_err = None
-    for attempt in range(1 + retries):
-        try:
-            return await request.get(url, timeout=timeout_ms)
-        except Exception as e:
-            last_err = e
-            await asyncio.sleep(0.8 * (attempt + 1))
-    raise last_err
+def _get_storage_base() -> Path:
+    """
+    Directorio base en servidor/contendor.
+    Env: SIGED_STORAGE_DIR (default: /data)
+    """
+    base = os.getenv("SIGED_STORAGE_DIR", "/data").strip() or "/data"
+    return Path(base).expanduser().resolve()
+
+def get_job_dir(job_id: str) -> Path:
+    """
+    Ruta: <SIGED_STORAGE_DIR>/SIGED_DOCUMENTOS/<job_id>
+    """
+    job_id = _sanitize_job_id(job_id)
+    return _get_storage_base() / "SIGED_DOCUMENTOS" / job_id
+
+def list_job_files(job_id: str) -> List[str]:
+    """
+    Lista archivos dentro del job dir (solo files, no carpetas).
+    Ordenado por nombre.
+    """
+    d = get_job_dir(job_id)
+    if not d.exists() or not d.is_dir():
+        return []
+    return sorted([p.name for p in d.iterdir() if p.is_file()])
+
+def get_current_job_id() -> Optional[str]:
+    return _current_job_id
+
+def get_current_job_dir() -> Optional[str]:
+    return str(_current_job_dir) if _current_job_dir else None
 
 # ============================
-#  Descarga por respuesta/ página (como en test.py)
+#  Descarga por respuesta/ página
 # ============================
 
 async def _save_from_response(response, download_dir: Path) -> Optional[str]:
@@ -196,7 +226,6 @@ async def _save_from_response(response, download_dir: Path) -> Optional[str]:
     fname = _parse_filename_from_cd(cd)
 
     if not fname:
-        # deduce por URL
         part = url.split("?", 1)[0].rstrip("/").split("/")[-1] or "archivo"
         if "." not in part:
             ext = _ext_for_content_type(ct)
@@ -283,7 +312,7 @@ async def _try_download_from_page(page, download_dir: Path) -> Optional[str]:
     return None
 
 # ============================
-#  Navegación APEX por diálogos (hash-dialog)
+#  Navegación APEX por diálogos
 # ============================
 
 _BASE = "https://cgrweb.cgr.go.cr/apex/"
@@ -299,20 +328,6 @@ def _decode_dialog_url(hash_href: str) -> Optional[str]:
         return None
     inner = unquote(enc)  # "f?p=108:630:..."
     return urljoin(_BASE, inner)
-
-async def _dump_links(tag, frame):
-    # solo diagnóstico opcional; mantener silencioso en producción
-    try:
-        anchors = frame.locator("a")
-        count = await anchors.count()
-        # print(f"[{tag}] anchors: {count}")
-        for i in range(min(count, 10)):
-            a = anchors.nth(i)
-            href = await a.get_attribute("href")
-            # text = (await a.inner_text()).strip()[:60]
-            # print(f"   • '{text}' → {href}")
-    except Exception:
-        pass
 
 async def _crawl_dialog_chain(context, start_url: str, download_dir: Path, max_depth: int = 3) -> int:
     """Abre start_url y sigue #action$a-dialog-open?... hasta max_depth. Devuelve #archivos descargados."""
@@ -337,13 +352,10 @@ async def _crawl_dialog_chain(context, start_url: str, download_dir: Path, max_d
             except PlaywrightTimeoutError:
                 pass
 
-            await _dump_links(f"D{depth}", page)
-
             # intento directo de descarga en esta página
             name = await _try_download_from_page(page, download_dir)
             if name:
                 downloads += 1
-                # actualiza última descarga visible en progreso
                 await progreso.inc_done(last_file=name)
 
             # recolecta nuevos diálogos para profundizar
@@ -373,13 +385,34 @@ def _can_start() -> bool:
 def is_running() -> bool:
     return (_current_task is not None) and (not _current_task.done())
 
-async def start_download_if_free(url: str) -> bool:
-    global _current_task
+async def start_download_if_free(url: str, job_id: Optional[str] = None) -> Optional[str]:
+    """
+    Inicia descarga si está libre.
+    Retorna job_id si inició, o None si ya hay un job corriendo.
+    """
+    global _current_task, _current_job_id, _current_job_dir
+
     if not _can_start():
-        return False
+        return None
+
     _cancel_event.clear()
-    _current_task = asyncio.create_task(descargar_documentos(url))
-    return True
+
+    jid = _sanitize_job_id(job_id or uuid4().hex[:10])
+    jdir = get_job_dir(jid)
+
+    # crea carpetas
+    try:
+        jdir.mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        await progreso.reset(url=url, job_id=jid)
+        await progreso.set_error(f"No se pudo crear carpeta de storage: {e}")
+        return None
+
+    _current_job_id = jid
+    _current_job_dir = jdir
+
+    _current_task = asyncio.create_task(descargar_documentos(url, jid))
+    return jid
 
 async def cancel_descarga() -> bool:
     global _current_task
@@ -392,22 +425,28 @@ async def cancel_descarga() -> bool:
 #  Flujo principal de descarga
 # ============================
 
-async def descargar_documentos(url: str) -> None:
+async def descargar_documentos(url: str, job_id: str) -> None:
     """
     Flujo principal de descarga. Actualiza `progreso`.
     Respeta cancelación (_cancel_event).
+    Guarda en server-side: <SIGED_STORAGE_DIR>/SIGED_DOCUMENTOS/<job_id>/
     """
-    await progreso.reset(url=url)
+    global _current_job_id, _current_job_dir
+
+    job_id = _sanitize_job_id(job_id)
+    _current_job_id = job_id
+    _current_job_dir = get_job_dir(job_id)
+
+    await progreso.reset(url=url, job_id=job_id)
 
     if not _is_allowed_url(url):
         await progreso.set_error("URL inválida o dominio no permitido (cgrweb.cgr.go.cr).")
         return
 
-    await progreso.start(url)
+    await progreso.start(url, job_id)
 
-    # base de descarga configurable
-    ruta_descarga_base = _get_download_base()
-    ruta_descarga = ruta_descarga_base / "SIGED_DOCUMENTOS"
+    # directorio de descarga del job
+    ruta_descarga = get_job_dir(job_id)
     try:
         ruta_descarga.mkdir(parents=True, exist_ok=True)
     except Exception as e:
@@ -416,8 +455,6 @@ async def descargar_documentos(url: str) -> None:
 
     HEADLESS = os.getenv("SIGED_HEADLESS", "0") == "1"
     GOTO_TIMEOUT_MS = int(os.getenv("SIGED_GOTO_TIMEOUT_MS", "90000"))
-    FILE_TIMEOUT_MS = int(os.getenv("SIGED_FILE_TIMEOUT_MS", "30000"))
-    RETRIES = int(os.getenv("SIGED_FILE_RETRIES", "2"))
 
     try:
         async with async_playwright() as p:
@@ -447,7 +484,6 @@ async def descargar_documentos(url: str) -> None:
                 return
 
             # Localiza los enlaces 'Ver Documento' (hash-dialog)
-            # Nota: hacemos el filtro por prefijo; el título puede variar, así que no forzamos.
             doc_links = page.locator('a[href^="#action$a-dialog-open?"]')
             total = await doc_links.count()
             if total == 0:
@@ -467,12 +503,10 @@ async def descargar_documentos(url: str) -> None:
                 href = await doc_links.nth(i).get_attribute("href")
                 real = _decode_dialog_url(href or "")
                 if not real:
-                    # No se pudo decodificar: contamos como atendido sin archivo
                     await progreso.inc_done(last_file=f"(no decodificado {i+1})")
                     continue
 
                 # Explora la cadena de diálogos hasta 3 niveles y trata de descargar
-                # Cada archivo descargado actualizará progreso.inc_done(last_file=...)
                 before = progreso.done
                 _ = await _crawl_dialog_chain(context, real, ruta_descarga, max_depth=3)
                 after = progreso.done
