@@ -3,6 +3,7 @@ import re
 import json
 import asyncio
 import uuid
+import traceback
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Tuple
@@ -51,6 +52,9 @@ def get_job_dir(job_id: str) -> Path:
 
 
 def ensure_job_dir(job_id: str) -> Path:
+    """
+    Crea el directorio del job si no existe y lo retorna.
+    """
     d = get_job_dir(job_id)
     d.mkdir(parents=True, exist_ok=True)
     return d
@@ -63,7 +67,7 @@ def list_job_files(job_id: str) -> List[str]:
     job_dir = get_job_dir(job_id)
     if not job_dir.exists():
         return []
-    files = []
+    files: List[str] = []
     for p in job_dir.iterdir():
         if p.is_file():
             files.append(p.name)
@@ -108,6 +112,17 @@ def _decode_dialog_url(href: str) -> str:
     if "a-dialog-open" not in href:
         return ""
     return href
+
+
+def _format_exc(e: Exception) -> str:
+    """
+    Devuelve un string corto + traceback para depurar errores del worker.
+    Importante: esto evita que el handler de excepciones falle por NameError.
+    """
+    try:
+        return "".join(traceback.format_exception(type(e), e, e.__traceback__)).strip()
+    except Exception:
+        return str(e)
 
 
 # =========================================================
@@ -229,6 +244,24 @@ async def cancel_descarga() -> bool:
     return True
 
 
+def _task_done_callback(task: asyncio.Task) -> None:
+    """
+    Captura excepciones no manejadas del background task.
+    Si el task muere y no se llamó progreso.set_error(), al menos queda reflejado.
+    """
+    async def _mark_error(msg: str) -> None:
+        await progreso.set_error(msg)
+
+    try:
+        exc = task.exception()
+        if exc is not None:
+            asyncio.create_task(_mark_error(f"Worker crashed:\n{_format_exc(exc)}"))
+    except asyncio.CancelledError:
+        pass
+    except Exception as e:
+        asyncio.create_task(_mark_error(f"Worker callback failed:\n{_format_exc(e)}"))
+
+
 # =========================================================
 #  API pública que usará routes.py
 # =========================================================
@@ -249,7 +282,10 @@ async def start_download_if_free(url: str, job_id: Optional[str] = None) -> Opti
     _current_job_id = jid
     _current_job_dir = ensure_job_dir(jid)
 
+    # Importante: el worker corre async y cualquier excepción debe quedar reflejada en progreso.error
     _current_task = asyncio.create_task(descargar_documentos(url=url, job_id=jid))
+    _current_task.add_done_callback(_task_done_callback)
+
     return jid
 
 
@@ -257,11 +293,21 @@ async def start_download_if_free(url: str, job_id: Optional[str] = None) -> Opti
 #  Descarga (Playwright) -> server-side job_dir
 # =========================================================
 
-async def _download_from_page(page, job_dir: Path, timeout_ms: int, retries: int) -> Optional[str]:
+async def _download_from_page(page, job_dir: Path, timeout_ms: int, retries: int, scope=None) -> Optional[str]:
     """
     Intenta disparar descarga desde la UI actual.
     Retorna filename guardado si logró, o None si no hubo descarga.
+
+    scope:
+      - Si se pasa, debe ser un Locator que represente el diálogo/overlay.
+      - Si no, busca en toda la página.
+
+    Nota importante:
+      - Usamos page.expect_download() siempre sobre page (aunque el click sea dentro del diálogo)
+        porque el evento download lo emite el Page.
     """
+    root = scope if scope is not None else page
+
     for _ in range(max(1, retries + 1)):
         if _cancel_event.is_set():
             return None
@@ -272,14 +318,15 @@ async def _download_from_page(page, job_dir: Path, timeout_ms: int, retries: int
                 # Ajustá selector si ya tenés uno definido.
                 # (lo dejamos tolerante: busca cosas comunes)
                 candidates = [
+                    'button:has-text("Descargar")',
+                    'a:has-text("Descargar")',
                     'text=/descargar/i',
                     'text=/download/i',
                     'a[download]',
-                    'button:has-text("Descargar")',
                 ]
                 clicked = False
                 for sel in candidates:
-                    loc = page.locator(sel)
+                    loc = root.locator(sel)
                     if await loc.count() > 0:
                         await loc.first.click()
                         clicked = True
@@ -304,50 +351,102 @@ async def _download_from_page(page, job_dir: Path, timeout_ms: int, retries: int
     return None
 
 
-async def _crawl_dialog_chain(context, start_href: str, job_dir: Path, max_depth: int = 3) -> int:
+async def _open_dialog_and_download(page, link_locator, job_dir: Path, timeout_ms: int, retries: int) -> Optional[str]:
     """
-    Abre secuencias de diálogos y trata de descargar.
-    Retorna cantidad de archivos descargados dentro de la cadena.
+    Abre el diálogo APEX para un documento (click en el link #action$a-dialog-open...)
+    y trata de descargar el archivo desde el diálogo visible.
+
+    Por qué existe esta función:
+      - Antes se abría una página nueva (about:blank) y se intentaba descargar "desde ahí".
+        Eso NO funciona porque el diálogo real vive en la página principal.
+      - Este cambio mantiene todo en la misma page:
+        click link -> aparece diálogo -> click Descargar -> se produce download.
+
+    Retorna:
+      - nombre del archivo si se descargó
+      - None si no se pudo descargar para ese documento
     """
-    downloaded_count = 0
+    if _cancel_event.is_set():
+        return None
 
-    # Mantenemos una página dedicada por chain para aislar.
-    page = await context.new_page()
-
+    # 1) Click en el link que abre el diálogo
     try:
-        # Tu lógica real probablemente navega sobre hrefs hash-dialog.
-        # Aquí hacemos lo mínimo: intentar abrir el href como URL relativa no aplica;
-        # normalmente se requiere click sobre el link real en la página principal.
-        # Como tu implementación original ya funcionaba, aquí solo dejamos un "hook":
-        #
-        # Si tu "real" es un hash, lo aplicamos via evaluate para simular click/navegación.
-        # (Puedes reemplazar este bloque por tu lógica actual).
-        await page.goto("about:blank")
-        # No hacemos nada extra si no hay una URL real que cargar.
+        await link_locator.scroll_into_view_if_needed()
+        await link_locator.click()
     except Exception:
-        pass
+        return None
+
+    # 2) Detectar el diálogo visible (APEX puede renderizar diferentes contenedores)
+    dialog = None
+    candidates = [
+        page.locator(".ui-dialog:visible"),
+        page.locator('div[role="dialog"]:visible'),
+        page.locator(".t-Dialog:visible"),
+    ]
 
     try:
-        # Intento de descarga en el contexto actual (si aplica)
+        # intento inmediato
+        for c in candidates:
+            if await c.count() > 0:
+                dialog = c.first
+                break
+
+        # si no apareció, esperamos un poco (polling rápido)
+        if dialog is None:
+            for _ in range(50):  # ~10s
+                if _cancel_event.is_set():
+                    return None
+                for c in candidates:
+                    if await c.count() > 0:
+                        dialog = c.first
+                        break
+                if dialog is not None:
+                    break
+                await asyncio.sleep(0.2)
+
+        if dialog is None:
+            # No se detectó un contenedor visible del diálogo
+            return None
+
+        try:
+            await dialog.wait_for(state="visible", timeout=10_000)
+        except Exception:
+            # si ya está visible, no pasa nada
+            pass
+
+        # 3) Dentro del diálogo, disparar la descarga
         fname = await _download_from_page(
             page=page,
             job_dir=job_dir,
-            timeout_ms=int(os.getenv("SIGED_FILE_TIMEOUT_MS", "30000")),
-            retries=int(os.getenv("SIGED_FILE_RETRIES", "2")),
+            timeout_ms=timeout_ms,
+            retries=retries,
+            scope=dialog,
         )
-        if fname:
-            downloaded_count += 1
-            await progreso.inc_done(last_file=fname)
 
-        # Si necesitás explorar más profundidad, aquí iría tu lógica real.
-        # Por ahora lo dejamos "mínimo viable".
-        return downloaded_count
-
-    finally:
+        # 4) Cerrar el diálogo para continuar con el siguiente doc
         try:
-            await page.close()
+            close_btns = [
+                dialog.locator('button[aria-label="Close"]'),
+                dialog.locator(".ui-dialog-titlebar-close"),
+                dialog.locator('button:has-text("Cerrar")'),
+                dialog.locator('button:has-text("Close")'),
+            ]
+            closed = False
+            for b in close_btns:
+                if await b.count() > 0:
+                    await b.first.click()
+                    closed = True
+                    break
+            if not closed:
+                # fallback típico para overlays
+                await page.keyboard.press("Escape")
         except Exception:
             pass
+
+        return fname
+
+    except Exception:
+        return None
 
 
 async def descargar_documentos(url: str, job_id: str) -> None:
@@ -407,24 +506,35 @@ async def descargar_documentos(url: str, job_id: str) -> None:
                     await browser.close()
                     return
 
-                href = await doc_links.nth(i).get_attribute("href")
-                real = _decode_dialog_url(href or "")
-                if not real:
-                    await progreso.inc_done(last_file=f"(no decodificado {i+1})")
-                    continue
+                link = doc_links.nth(i)
 
-                # Aquí tu implementación original exploraba dialogs y descargaba.
-                # Para no romper tu flujo, hacemos el "hook" mínimo.
-                before = (await progreso.snapshot()).get("done", 0)
-                _ = await _crawl_dialog_chain(context, real, job_dir, max_depth=3)
-                after = (await progreso.snapshot()).get("done", 0)
+                # En tu versión anterior se intentaba "decodificar" href.
+                # Mantengo la lectura (por si la usás para debug), pero la descarga
+                # ahora ocurre haciendo click real sobre el link en la página.
+                try:
+                    href = await link.get_attribute("href")
+                    _ = _decode_dialog_url(href or "")
+                except Exception:
+                    pass
 
-                if after == before:
+                fname = await _open_dialog_and_download(
+                    page=page,
+                    link_locator=link,
+                    job_dir=job_dir,
+                    timeout_ms=FILE_TIMEOUT_MS,
+                    retries=RETRIES,
+                )
+
+                if fname:
+                    await progreso.inc_done(last_file=fname)
+                else:
+                    # Muy importante: SIEMPRE avanzamos el contador, aunque no haya archivo,
+                    # para evitar quedarnos pegados con done=0.
                     await progreso.inc_done(last_file=f"(sin archivo {i+1})")
 
             await browser.close()
             await progreso.set_finalizado()
 
     except Exception as e:
-        await progreso.set_error(f"Fallo inesperado: {e}")
+        await progreso.set_error(f"Fallo inesperado:\n{_format_exc(e)}")
         return
