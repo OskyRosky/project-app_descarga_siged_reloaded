@@ -1,30 +1,30 @@
-# Ignorar entornos virtuales Python en cualquier carpeta
-**/venv/
-**/venv/**
-
-# Ignorar node_modules en cualquier carpeta
-**/node_modules/
-**/node_modules/**
-
-# Archivos del sistema
+# macOS
 .DS_Store
 
-# Archivos de Python
+# Python venv (en cualquier subcarpeta)
+.venv/
+venv/
+**/.venv/
+**/venv/
+
+# Python caches
 __pycache__/
-*.py[cod]
-*.pyo
-*.pyd
+**/__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
 
-# Archivos temporales
-*.log
-*.tmp
+# Frontend builds
+node_modules/
+**/node_modules/
+dist/
+**/dist/
 
-# Archivos y carpetas de entorno
-.env
-.env.*
+# Playwright reports
+**/playwright-report/
+**/test-results/
 
-# VSCode config
-.vscode/
-
-# Carpeta de respaldo (opcional, si no la querés subir)
-RESPALDO/
+# Docker bundles / images
+*.tar
+*.tar.gz
+*.zip

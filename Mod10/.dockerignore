@@ -1,0 +1,26 @@
+# macOS
+.DS_Store
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+
+# Node / React
+node_modules/
+dist/
+
+# Logs / artifacts
+*.log
+
+# Docker / images / bundles
+*.tar
+*.tar.gz
+*.zip
+
+# Playwright artifacts (por si acaso)
+**/playwright-report/
+**/test-results/
