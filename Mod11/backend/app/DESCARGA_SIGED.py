@@ -6,7 +6,7 @@ import uuid
 import traceback
 from dataclasses import dataclass, asdict
 from pathlib import Path
-from typing import Optional, List, Dict, Any, Tuple
+from typing import Optional, List, Dict, Any
 
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 
@@ -293,6 +293,57 @@ async def start_download_if_free(url: str, job_id: Optional[str] = None) -> Opti
 #  Descarga (Playwright) -> server-side job_dir
 # =========================================================
 
+async def _click_download_anywhere(page, scope_locator=None) -> bool:
+    """
+    Intenta encontrar y clickear un control de descarga.
+
+    - Primero busca dentro de scope_locator (si existe)
+    - Luego busca en la página
+    - Luego busca dentro de frames/iframes (típico en APEX)
+    """
+    candidates = [
+        'button:has-text("Descargar")',
+        'a:has-text("Descargar")',
+        'text=/descargar/i',
+        'text=/download/i',
+        'a[download]',
+    ]
+
+    async def _try_root(root) -> bool:
+        for sel in candidates:
+            loc = root.locator(sel)
+            if await loc.count() > 0:
+                try:
+                    await loc.first.click()
+                    return True
+                except Exception:
+                    # si el click falla, seguimos probando
+                    continue
+        return False
+
+    # 1) scope (diálogo)
+    if scope_locator is not None:
+        if await _try_root(scope_locator):
+            return True
+
+    # 2) página completa
+    if await _try_root(page):
+        return True
+
+    # 3) frames (APEX suele meter contenido en iframe dentro del diálogo)
+    for fr in page.frames:
+        try:
+            for sel in candidates:
+                loc = fr.locator(sel)
+                if await loc.count() > 0:
+                    await loc.first.click()
+                    return True
+        except Exception:
+            continue
+
+    return False
+
+
 async def _download_from_page(page, job_dir: Path, timeout_ms: int, retries: int, scope=None) -> Optional[str]:
     """
     Intenta disparar descarga desde la UI actual.
@@ -303,34 +354,16 @@ async def _download_from_page(page, job_dir: Path, timeout_ms: int, retries: int
       - Si no, busca en toda la página.
 
     Nota importante:
-      - Usamos page.expect_download() siempre sobre page (aunque el click sea dentro del diálogo)
+      - Usamos page.expect_download() siempre sobre page (aunque el click sea dentro del diálogo/iframe)
         porque el evento download lo emite el Page.
     """
-    root = scope if scope is not None else page
-
     for _ in range(max(1, retries + 1)):
         if _cancel_event.is_set():
             return None
 
         try:
             async with page.expect_download(timeout=timeout_ms) as download_info:
-                # Intenta clickear botón/link típico de descarga.
-                # Ajustá selector si ya tenés uno definido.
-                # (lo dejamos tolerante: busca cosas comunes)
-                candidates = [
-                    'button:has-text("Descargar")',
-                    'a:has-text("Descargar")',
-                    'text=/descargar/i',
-                    'text=/download/i',
-                    'a[download]',
-                ]
-                clicked = False
-                for sel in candidates:
-                    loc = root.locator(sel)
-                    if await loc.count() > 0:
-                        await loc.first.click()
-                        clicked = True
-                        break
+                clicked = await _click_download_anywhere(page, scope_locator=scope)
                 if not clicked:
                     # no encontró nada que clickear
                     return None
@@ -351,16 +384,59 @@ async def _download_from_page(page, job_dir: Path, timeout_ms: int, retries: int
     return None
 
 
-async def _open_dialog_and_download(page, link_locator, job_dir: Path, timeout_ms: int, retries: int) -> Optional[str]:
+async def _detect_dialog(page) -> Optional[Any]:
     """
-    Abre el diálogo APEX para un documento (click en el link #action$a-dialog-open...)
-    y trata de descargar el archivo desde el diálogo visible.
+    Detecta un diálogo/modal visible.
+    APEX puede usar:
+      - jQuery UI: .ui-dialog
+      - Universal Theme: .t-Dialog
+      - genérico: [role="dialog"]
+    """
+    candidates = [
+        page.locator(".ui-dialog:visible"),
+        page.locator(".t-Dialog:visible"),
+        page.locator('div[role="dialog"]:visible'),
+    ]
+    for c in candidates:
+        try:
+            if await c.count() > 0:
+                return c.first
+        except Exception:
+            continue
+    return None
 
-    Por qué existe esta función:
-      - Antes se abría una página nueva (about:blank) y se intentaba descargar "desde ahí".
-        Eso NO funciona porque el diálogo real vive en la página principal.
-      - Este cambio mantiene todo en la misma page:
-        click link -> aparece diálogo -> click Descargar -> se produce download.
+
+async def _close_dialog(page, dialog) -> None:
+    """
+    Cierra el diálogo/modal si existe.
+    """
+    try:
+        close_btns = [
+            dialog.locator('button[aria-label="Close"]'),
+            dialog.locator(".ui-dialog-titlebar-close"),
+            dialog.locator('button:has-text("Cerrar")'),
+            dialog.locator('button:has-text("Close")'),
+        ]
+        for b in close_btns:
+            try:
+                if await b.count() > 0:
+                    await b.first.click()
+                    return
+            except Exception:
+                continue
+        # fallback
+        await page.keyboard.press("Escape")
+    except Exception:
+        pass
+
+
+async def _open_target_and_download(page, link_locator, job_dir: Path, timeout_ms: int, retries: int) -> Optional[str]:
+    """
+    Abre el documento (vía diálogo o popup/tab) y trata de descargar.
+
+    Casos que manejamos:
+      A) click abre un diálogo (modal) en la misma page
+      B) click abre un popup/tab (y vos ves "denegado" y se cierra): lo capturamos y descargamos desde ahí
 
     Retorna:
       - nombre del archivo si se descargó
@@ -369,52 +445,74 @@ async def _open_dialog_and_download(page, link_locator, job_dir: Path, timeout_m
     if _cancel_event.is_set():
         return None
 
-    # 1) Click en el link que abre el diálogo
+    popup = None
+    dialog = None
+
+    # 1) Click y tratar de capturar popup rápidamente (si existe)
     try:
         await link_locator.scroll_into_view_if_needed()
-        await link_locator.click()
+
+        # OJO: si no hay popup, esto hace timeout rápido y seguimos (sin fallar el job)
+        try:
+            async with page.expect_popup(timeout=1500) as pop_info:
+                await link_locator.click(force=True)
+            popup = await pop_info.value
+        except Exception:
+            # sin popup, el click igual ya se ejecutó arriba en muchos casos,
+            # pero para estar seguros, hacemos un click (tolerante) si no hubo popup
+            try:
+                await link_locator.click(force=True)
+            except Exception:
+                return None
+
     except Exception:
         return None
 
-    # 2) Detectar el diálogo visible (APEX puede renderizar diferentes contenedores)
-    dialog = None
-    candidates = [
-        page.locator(".ui-dialog:visible"),
-        page.locator('div[role="dialog"]:visible'),
-        page.locator(".t-Dialog:visible"),
-    ]
+    # 2) Si hubo popup/tab, trabajamos en él
+    if popup is not None:
+        try:
+            try:
+                await popup.wait_for_load_state("domcontentloaded", timeout=15_000)
+            except Exception:
+                pass
 
-    try:
-        # intento inmediato
-        for c in candidates:
-            if await c.count() > 0:
-                dialog = c.first
-                break
+            fname = await _download_from_page(
+                page=popup,
+                job_dir=job_dir,
+                timeout_ms=timeout_ms,
+                retries=retries,
+                scope=None,
+            )
 
-        # si no apareció, esperamos un poco (polling rápido)
-        if dialog is None:
-            for _ in range(50):  # ~10s
-                if _cancel_event.is_set():
-                    return None
-                for c in candidates:
-                    if await c.count() > 0:
-                        dialog = c.first
-                        break
-                if dialog is not None:
-                    break
-                await asyncio.sleep(0.2)
+            # cerrar popup para seguir
+            try:
+                await popup.close()
+            except Exception:
+                pass
 
-        if dialog is None:
-            # No se detectó un contenedor visible del diálogo
+            return fname
+
+        except Exception:
+            try:
+                await popup.close()
+            except Exception:
+                pass
             return None
 
-        try:
-            await dialog.wait_for(state="visible", timeout=10_000)
-        except Exception:
-            # si ya está visible, no pasa nada
-            pass
+    # 3) Si no hubo popup, esperamos detectar diálogo en la misma page
+    try:
+        # pequeño wait para que APEX renderice el modal
+        for _ in range(60):  # ~12s
+            if _cancel_event.is_set():
+                return None
+            dialog = await _detect_dialog(page)
+            if dialog is not None:
+                break
+            await asyncio.sleep(0.2)
 
-        # 3) Dentro del diálogo, disparar la descarga
+        if dialog is None:
+            return None
+
         fname = await _download_from_page(
             page=page,
             job_dir=job_dir,
@@ -423,26 +521,7 @@ async def _open_dialog_and_download(page, link_locator, job_dir: Path, timeout_m
             scope=dialog,
         )
 
-        # 4) Cerrar el diálogo para continuar con el siguiente doc
-        try:
-            close_btns = [
-                dialog.locator('button[aria-label="Close"]'),
-                dialog.locator(".ui-dialog-titlebar-close"),
-                dialog.locator('button:has-text("Cerrar")'),
-                dialog.locator('button:has-text("Close")'),
-            ]
-            closed = False
-            for b in close_btns:
-                if await b.count() > 0:
-                    await b.first.click()
-                    closed = True
-                    break
-            if not closed:
-                # fallback típico para overlays
-                await page.keyboard.press("Escape")
-        except Exception:
-            pass
-
+        await _close_dialog(page, dialog)
         return fname
 
     except Exception:
@@ -490,6 +569,12 @@ async def descargar_documentos(url: str, job_id: str) -> None:
                 await browser.close()
                 return
 
+            # APEX a veces carga contenido asíncrono; esto ayuda a estabilizar
+            try:
+                await page.wait_for_load_state("domcontentloaded", timeout=15_000)
+            except Exception:
+                pass
+
             # Localiza los enlaces 'Ver Documento' (hash-dialog)
             doc_links = page.locator('a[href^="#action$a-dialog-open?"]')
             total = await doc_links.count()
@@ -510,14 +595,14 @@ async def descargar_documentos(url: str, job_id: str) -> None:
 
                 # En tu versión anterior se intentaba "decodificar" href.
                 # Mantengo la lectura (por si la usás para debug), pero la descarga
-                # ahora ocurre haciendo click real sobre el link en la página.
+                # ocurre haciendo click real sobre el link en la página.
                 try:
                     href = await link.get_attribute("href")
                     _ = _decode_dialog_url(href or "")
                 except Exception:
                     pass
 
-                fname = await _open_dialog_and_download(
+                fname = await _open_target_and_download(
                     page=page,
                     link_locator=link,
                     job_dir=job_dir,
@@ -528,11 +613,19 @@ async def descargar_documentos(url: str, job_id: str) -> None:
                 if fname:
                     await progreso.inc_done(last_file=fname)
                 else:
-                    # Muy importante: SIEMPRE avanzamos el contador, aunque no haya archivo,
-                    # para evitar quedarnos pegados con done=0.
-                    await progreso.inc_done(last_file=f"(sin archivo {i+1})")
+                    # diferenciamos si no hubo diálogo vs no hubo descarga
+                    dialog_now = await _detect_dialog(page)
+                    if dialog_now is None:
+                        await progreso.inc_done(last_file=f"(sin dialog {i+1})")
+                    else:
+                        await progreso.inc_done(last_file=f"(sin archivo {i+1})")
+                        await _close_dialog(page, dialog_now)
 
-            await browser.close()
+            try:
+                await browser.close()
+            except Exception:
+                pass
+
             await progreso.set_finalizado()
 
     except Exception as e:
