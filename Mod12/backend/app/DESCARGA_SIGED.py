@@ -3,7 +3,7 @@ import re
 import asyncio
 import unicodedata
 from pathlib import Path
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Dict, Any
 from urllib.parse import unquote, urlparse, urljoin
 
 from platformdirs import user_downloads_dir
@@ -16,223 +16,315 @@ from playwright.async_api import async_playwright, TimeoutError as PlaywrightTim
 class ProgresoDescarga:
     """
     Estado global y seguro (vía asyncio.Lock).
-    Estados: inicio | descargando | finalizado | error | cancelado
+
+    ⚠️ Importante (SIGED Reloaded - descarga en CLIENTE):
+    - El backend YA NO guarda archivos en disco del servidor.
+    - El backend hace "descubrimiento" (manifest): nombre + URL directa de descarga.
+    - El frontend descarga secuencialmente en la PC del usuario.
+
+    Estados (status): inicio | descubriendo | esperando_descarga_cliente | finalizado | error | cancelado
     """
     def __init__(self) -> None:
         self._lock = asyncio.Lock()
-        self.status: str = "inicio"        # inicio | descargando | finalizado | error | cancelado
-        self.total: int = 0
-        self.done: int = 0
-        self.percent: int = 0
+
+        # Estado macro
+        self.status: str = "inicio"        # inicio | descubriendo | esperando_descarga_cliente | finalizado | error | cancelado
+        self.phase: str = "idle"           # idle | discovery | client_download
+        self.current_url: str = ""
+
+        # Métricas de descubrimiento (backend)
+        self.total: int = 0                # total de documentos/adjuntos esperados (según tabla)
+        self.discovered_done: int = 0      # cuántos descubrimos (uno a uno)
+
+        # Métricas de descarga (cliente)
+        self.client_done: int = 0          # cuántos archivos el cliente reporta como descargados
+
+        # UI
+        self.percent: int = 0              # porcentaje combinado discovery + client (A: una sola barra)
         self.last_file: str = ""
         self.last_error: str = ""
-        self.current_url: str = ""
+
+        # Manifest descubierto (en memoria)
+        self.files: List[Dict[str, str]] = []   # [{"name": "...", "url": "https://..."}]
+        self._seen_urls: set[str] = set()       # para evitar duplicados
 
     async def reset(self, url: str = "") -> None:
         async with self._lock:
             self.status = "inicio"
+            self.phase = "idle"
+            self.current_url = url
+
             self.total = 0
-            self.done = 0
+            self.discovered_done = 0
+            self.client_done = 0
+
             self.percent = 0
             self.last_file = ""
             self.last_error = ""
-            self.current_url = url
+
+            self.files = []
+            self._seen_urls = set()
 
     async def start(self, url: str) -> None:
         async with self._lock:
-            self.status = "descargando"
-            self.total = 0
-            self.done = 0
-            self.percent = 0
-            self.last_file = ""
-            self.last_error = ""
             self.current_url = url
+            self.status = "descubriendo"
+            self.phase = "discovery"
+            self.last_error = ""
+            self.last_file = ""
+            self._recalc_percent_locked()
 
-    async def set_total(self, n: int) -> None:
+    async def set_total(self, total: int) -> None:
         async with self._lock:
-            self.total = int(max(0, n))
-            self.percent = int((self.done * 100) / self.total) if self.total > 0 else 0
+            self.total = max(int(total), 0)
+            self._recalc_percent_locked()
 
-    async def inc_done(self, last_file: str = "") -> None:
+    async def add_discovered(self, name: str, url: str) -> None:
+        """
+        Registra un archivo descubierto (backend).
+        - No descarga el archivo.
+        - Solo guarda (name, url) en memoria.
+        """
         async with self._lock:
-            self.done += 1
-            if last_file:
-                self.last_file = last_file
-            self.percent = int((self.done * 100) / self.total) if self.total > 0 else (100 if self.done > 0 else 0)
+            clean_url = (url or "").strip()
+            if clean_url and clean_url not in self._seen_urls:
+                self._seen_urls.add(clean_url)
+                self.files.append({"name": name, "url": clean_url})
+
+            self.discovered_done += 1
+            self.last_file = name or self.last_file
+            self._recalc_percent_locked()
+
+    async def inc_discovered_placeholder(self, label: str) -> None:
+        """Cuenta un 'documento atendido' aunque no se haya logrado extraer URL final."""
+        async with self._lock:
+            self.discovered_done += 1
+            self.last_file = label
+            self._recalc_percent_locked()
+
+    async def set_waiting_client(self) -> None:
+        """
+        Termina el discovery y deja listo para que el CLIENTE comience a descargar.
+        """
+        async with self._lock:
+            self.status = "esperando_descarga_cliente"
+            self.phase = "client_download"
+            self._recalc_percent_locked()
+
+    async def report_client_downloaded(self, filename: str = "") -> None:
+        """
+        Endpoint del frontend (fase 2): el cliente reporta '1 archivo descargado'.
+        Con esto mantenemos una sola barra de progreso (A).
+        """
+        async with self._lock:
+            self.client_done += 1
+            if filename:
+                self.last_file = filename
+            self._recalc_percent_locked()
 
     async def set_finalizado(self) -> None:
         async with self._lock:
             self.status = "finalizado"
-            if self.total == 0:
-                self.percent = 100
+            self.phase = "idle"
+            # Al final, forzamos 100%
+            self.percent = 100
+            # Normalizamos contadores para consistencia
+            # (si el cliente no reportó, client_done puede quedar en 0; el frontend mostrará su propio estado)
+            self.last_error = ""
 
     async def set_error(self, msg: str) -> None:
         async with self._lock:
             self.status = "error"
-            self.last_error = str(msg)
+            self.phase = "idle"
+            self.last_error = msg
+            self._recalc_percent_locked()
 
     async def set_cancelado(self) -> None:
         async with self._lock:
             self.status = "cancelado"
+            self.phase = "idle"
+            self._recalc_percent_locked()
 
-    def to_dict(self) -> dict:
+    def _recalc_percent_locked(self) -> None:
+        """
+        Progreso combinado (A):
+        - 0%..50% = discovery (backend)
+        - 50%..100% = descarga cliente (frontend)
+        Mantiene 1 barra estable sin reinicios.
+        """
+        if self.total <= 0:
+            self.percent = 0
+            return
+
+        # discovery (0..50)
+        d = min(max(self.discovered_done, 0), self.total) / self.total
+        # client (0..50) sobre el mismo total
+        c = min(max(self.client_done, 0), self.total) / self.total
+
+        combined = (d * 50.0) + (c * 50.0)
+        self.percent = int(round(min(max(combined, 0.0), 100.0)))
+
+    def to_dict(self) -> Dict[str, Any]:
         # Lectura sin lock por simplicidad (se actualiza en bloque bajo lock)
         return {
+            "ok": True,
             "status": self.status,
+            "phase": self.phase,
+            "url": self.current_url,
+
+            # Totales y avances (expuestos para UI)
             "total": self.total,
-            "done": self.done,
+            "discovered_done": self.discovered_done,
+            "client_done": self.client_done,
             "percent": self.percent,
+
             "last_file": self.last_file,
             "last_error": self.last_error,
-            "current_url": self.current_url,
+
+            # info del manifest (sin exponer todo si no lo piden)
+            "files_count": len(self.files),
         }
+
 
 # Instancias/globales de coordinación
 progreso = ProgresoDescarga()
-_cancel_event = asyncio.Event()
 _current_task: Optional[asyncio.Task] = None
+_cancel_event = asyncio.Event()
 
 # ============================
 #  Utilidades (nombres/archivos)
 # ============================
 
-def _sanitize_filename(filename: str) -> str:
-    filename = unquote(filename or "")
-    base, ext = os.path.splitext(filename)
-    base = unicodedata.normalize("NFKD", base).encode("ASCII", "ignore").decode("ASCII")
-    base = re.sub(r'[<>:"/\\|?*\x00-\x1F]', "", base).strip().rstrip(".")
-    ext  = re.sub(r'[<>:"/\\|?*\x00-\x1F]', "", ext)
-    if not base:
-        base = "archivo"
-    return f"{base}{ext}"
-
-def _unique_path(path: Path) -> Path:
-    if not path.exists():
-        return path
-    i = 1
-    while True:
-        cand = path.with_name(f"{path.stem} ({i}){path.suffix}")
-        if not cand.exists():
-            return cand
-        i += 1
-
-def _parse_filename_from_cd(cd: str) -> Optional[str]:
-    if not cd:
-        return None
-    m = re.search(r"filename\*\s*=\s*UTF-8''([^;]+)", cd, flags=re.I)
-    if m:
-        return _sanitize_filename(unquote(m.group(1)))
-    m = re.search(r'filename\s*=\s*"([^"]+)"', cd, flags=re.I)
-    if m:
-        return _sanitize_filename(m.group(1))
-    m = re.search(r'filename\s*=\s*([^;]+)', cd, flags=re.I)
-    if m:
-        return _sanitize_filename(m.group(1).strip())
-    return None
-
-# mapeo básico por content-type → extensión
-_CT_EXT = {
-    "application/pdf": ".pdf",
-    "application/msword": ".doc",
-    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
-    "application/vnd.ms-excel": ".xls",
-    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": ".xlsx",
-    "application/zip": ".zip",
-    "application/octet-stream": "",  # genérico
-}
-def _ext_for_content_type(ct: str) -> str:
-    if not ct:
-        return ""
-    ct = ct.split(";")[0].strip().lower()
-    return _CT_EXT.get(ct, "")
-
 def _is_allowed_url(url: str) -> bool:
     try:
-        p = urlparse(url)
-        if p.scheme not in ("http", "https"):
-            return False
-        return (p.netloc or "").lower() == "cgrweb.cgr.go.cr"
+        u = urlparse(url)
+        return u.scheme in ("http", "https") and (u.netloc or "").lower().endswith("cgrweb.cgr.go.cr")
     except Exception:
         return False
 
-# --- base de descargas configurable ---
-def _get_download_base() -> Path:
-    base = os.getenv("SIGED_HOST_DOWNLOADS", "").strip()
-    if base:
-        return Path(base).expanduser().resolve()
-    return Path(user_downloads_dir())
+def _sanitize_filename(name: str) -> str:
+    name = name or "archivo"
+    # quita tildes/acentos raros
+    nfkd = unicodedata.normalize("NFKD", name)
+    name = "".join([c for c in nfkd if not unicodedata.combining(c)])
+    # reemplaza caracteres no seguros
+    name = re.sub(r"[^\w\-.() ]+", "_", name).strip()
+    # evita nombres vacíos
+    return name or "archivo"
 
-# --- helper con reintentos y timeout para HTTP GET de archivos ---
-async def _http_get_with_retry(request, url: str, *, retries: int = 2, timeout_ms: int = 30000):
-    last_err = None
-    for attempt in range(1 + retries):
-        try:
-            return await request.get(url, timeout=timeout_ms)
-        except Exception as e:
-            last_err = e
-            await asyncio.sleep(0.8 * (attempt + 1))
-    raise last_err
+def _filename_from_content_disposition(cd: str) -> Optional[str]:
+    if not cd:
+        return None
+    # filename*=UTF-8''xxx or filename="xxx"
+    m = re.search(r"filename\*\s*=\s*UTF-8''([^;]+)", cd, re.IGNORECASE)
+    if m:
+        return unquote(m.group(1)).strip().strip('"')
+    m = re.search(r'filename\s*=\s*"([^"]+)"', cd, re.IGNORECASE)
+    if m:
+        return m.group(1).strip()
+    m = re.search(r"filename\s*=\s*([^;]+)", cd, re.IGNORECASE)
+    if m:
+        return m.group(1).strip().strip('"')
+    return None
+
+async def _guess_filename_via_headers(page, url: str) -> str:
+    """
+    Intenta obtener filename vía HEAD o Range GET (1 byte) para evitar bajar todo el archivo.
+    Si falla, usa el basename del URL.
+    """
+    fallback = Path(urlparse(url).path).name or "archivo"
+    try:
+        # 1) HEAD (si lo soporta)
+        resp = await page.request.fetch(url, method="HEAD")
+        cd = (resp.headers or {}).get("content-disposition") or (resp.headers or {}).get("Content-Disposition")
+        fn = _filename_from_content_disposition(cd or "")
+        if fn:
+            return _sanitize_filename(fn)
+    except Exception:
+        pass
+
+    try:
+        # 2) GET con Range para traer mínimo (si servidor lo soporta)
+        resp = await page.request.fetch(url, method="GET", headers={"Range": "bytes=0-0"})
+        cd = (resp.headers or {}).get("content-disposition") or (resp.headers or {}).get("Content-Disposition")
+        fn = _filename_from_content_disposition(cd or "")
+        if fn:
+            return _sanitize_filename(fn)
+    except Exception:
+        pass
+
+    return _sanitize_filename(fallback)
+
+def _get_download_base() -> Path:
+    """
+    Legacy: base de descarga (ANTES se usaba para guardar en SIGED_DOCUMENTOS).
+    Se conserva para orden y por si luego se requiere modo "proxy server" o debug.
+    """
+    try:
+        # Prioridad: variable de entorno
+        env = os.getenv("SIGED_DOWNLOAD_BASE", "").strip()
+        if env:
+            return Path(env).expanduser()
+        # Default: Downloads del usuario
+        return Path(user_downloads_dir())
+    except Exception:
+        return Path.home() / "Downloads"
+
 
 # ============================
 #  Descarga por respuesta/ página (como en test.py)
 # ============================
+# ⚠️ Nota: este bloque existía para "descargar y guardar" en disco.
+# En SIGED Reloaded (descarga en CLIENTE), lo mantenemos como referencia/legacy.
+# El flujo principal ahora usa "descubrimiento" (manifest) y NO escribe archivos.
 
-async def _save_from_response(response, download_dir: Path) -> Optional[str]:
-    """Guarda si parece archivo descargable; retorna el nombre si guardó."""
-    headers = response.headers or {}
-    url = response.url
-    ct = (headers.get("content-type", "") or "").lower()
+async def _http_get_with_retry(page, url: str, retries: int = 2):
+    last = None
+    for _ in range(max(retries, 1)):
+        try:
+            resp = await page.request.get(url)
+            if resp.ok:
+                return resp
+            last = Exception(f"HTTP {resp.status} for {url}")
+        except Exception as e:
+            last = e
+        await asyncio.sleep(0.3)
+    raise last or Exception("HTTP error")
 
-    looks_file = (
-        "application/" in ct
-        or any(url.lower().split("?", 1)[0].endswith(suf) for suf in (".pdf", ".doc", ".docx", ".xls", ".xlsx", ".zip"))
-        or "content-disposition" in {k.lower(): v for k, v in headers.items()}
-    )
-    if not looks_file:
+async def _save_from_response(resp, download_dir: Path) -> Optional[str]:
+    """
+    Legacy: guarda un response a disco.
+    Se mantiene por compatibilidad/orden (NO se usa en el flujo de manifest).
+    """
+    try:
+        if not resp.ok:
+            return None
+        cd = resp.headers.get("content-disposition", "") or resp.headers.get("Content-Disposition", "")
+        name = _filename_from_content_disposition(cd) or Path(urlparse(resp.url).path).name or "archivo"
+        name = _sanitize_filename(name)
+        data = await resp.body()
+        out = download_dir / name
+        out.write_bytes(data)
+        return name
+    except Exception:
         return None
 
-    body = await response.body()
-    cd = headers.get("content-disposition", "")
-    fname = _parse_filename_from_cd(cd)
-
-    if not fname:
-        # deduce por URL
-        part = url.split("?", 1)[0].rstrip("/").split("/")[-1] or "archivo"
-        if "." not in part:
-            ext = _ext_for_content_type(ct)
-            if ext and not part.endswith(ext):
-                part += ext
-            elif not ext:
-                part += ".bin"
-        fname = _sanitize_filename(part)
-
-    path = _unique_path(download_dir / fname)
-    path.write_bytes(body)
-
-    # marca descargas vacías
-    try:
-        if path.stat().st_size == 0:
-            path.rename(path.with_name(path.stem + "_incompleto" + path.suffix))
-    except Exception:
-        pass
-
-    return path.name
-
-async def _try_download_from_page(page, download_dir: Path) -> Optional[str]:
-    """Intenta localizar visor o links directos en la página actual y descargar; devuelve nombre si guardó."""
-    # 1) visor (embed/object/iframe)
+async def _discover_from_page(page) -> Optional[Tuple[str, str]]:
+    """
+    Descubre (sin guardar) un URL directo a archivo en la página actual.
+    Devuelve (filename, url).
+    """
+    # 1) visor (embed/object/iframe) -> src suele ser un get_blob / getfile directo
     for sel in ["embed", "object", "iframe"]:
         el = page.locator(sel)
         if await el.count():
             src = await el.first.get_attribute("src")
             if src:
                 u = urljoin(page.url, src)
-                resp = await page.request.get(u)
-                name = await _save_from_response(resp, download_dir)
-                if name:
-                    return name
+                name = await _guess_filename_via_headers(page, u)
+                return name, u
 
-    # 2) enlaces típicos
+    # 2) enlaces típicos (mismos candidates que antes, pero sin request.get/save)
     candidates = page.locator(
         'a[href*="get_blob"], a[href*="getfile"], a[href*="download"], '
         'a:has-text("Descargar"), a:has-text("Ver"), '
@@ -245,40 +337,10 @@ async def _try_download_from_page(page, download_dir: Path) -> Optional[str]:
         if not href:
             continue
         u = urljoin(page.url, href)
-        try:
-            resp = await page.request.get(u)
-            name = await _save_from_response(resp, download_dir)
-            if name:
-                return name
-        except Exception:
-            pass
 
-    # 3) escucha respuestas tras un click genérico
-    done = asyncio.Event()
-    saved: Optional[str] = None
-
-    async def listener(resp):
-        nonlocal saved
-        name = await _save_from_response(resp, download_dir)
-        if name:
-            saved = name
-            done.set()
-
-    page.on("response", listener)
-    try:
-        if n:
-            await candidates.first.click(timeout=5000)
-            try:
-                await asyncio.wait_for(done.wait(), timeout=8)
-                if saved:
-                    return saved
-            except asyncio.TimeoutError:
-                pass
-    finally:
-        try:
-            page.off("response", listener)
-        except Exception:
-            pass
+        # Intentamos inferir nombre sin bajar el archivo completo
+        name = await _guess_filename_via_headers(page, u)
+        return name, u
 
     return None
 
@@ -300,68 +362,55 @@ def _decode_dialog_url(hash_href: str) -> Optional[str]:
     inner = unquote(enc)  # "f?p=108:630:..."
     return urljoin(_BASE, inner)
 
-async def _dump_links(tag, frame):
-    # solo diagnóstico opcional; mantener silencioso en producción
+async def _dump_links(page) -> List[str]:
+    """Debug opcional: lista href visibles."""
+    links = []
+    a = page.locator("a")
+    n = await a.count()
+    for i in range(min(n, 200)):
+        href = await a.nth(i).get_attribute("href")
+        if href:
+            links.append(href)
+    return links
+
+async def _crawl_dialog_chain(context, start_url: str, max_depth: int = 3) -> Optional[Tuple[str, str]]:
+    """
+    Abre una cadena de diálogos APEX (hasta max_depth) y trata de descubrir un link directo a archivo.
+    Devuelve (name, url) si se pudo.
+    """
+    page = await context.new_page()
     try:
-        anchors = frame.locator("a")
-        count = await anchors.count()
-        # print(f"[{tag}] anchors: {count}")
-        for i in range(min(count, 10)):
-            a = anchors.nth(i)
-            href = await a.get_attribute("href")
-            # text = (await a.inner_text()).strip()[:60]
-            # print(f"   • '{text}' → {href}")
-    except Exception:
-        pass
+        await page.goto(start_url, timeout=60000)
 
-async def _crawl_dialog_chain(context, start_url: str, download_dir: Path, max_depth: int = 3) -> int:
-    """Abre start_url y sigue #action$a-dialog-open?... hasta max_depth. Devuelve #archivos descargados."""
-    downloads = 0
-    to_visit: List[Tuple[str, int]] = [(start_url, 1)]
-    seen = set()
+        # Intento directo en la página actual
+        found = await _discover_from_page(page)
+        if found:
+            return found
 
-    while to_visit:
-        if _cancel_event.is_set():
-            break
+        # Si no hay link directo, buscamos más diálogos encadenados (hash)
+        for _ in range(max_depth):
+            # si hay otro enlace dialog-open, seguimos
+            dialog_links = page.locator('a[href^="#action$a-dialog-open?"]')
+            if await dialog_links.count() == 0:
+                break
 
-        url, depth = to_visit.pop(0)
-        if (url, depth) in seen:
-            continue
-        seen.add((url, depth))
+            href = await dialog_links.first.get_attribute("href")
+            nxt = _decode_dialog_url(href or "")
+            if not nxt:
+                break
 
-        page = await context.new_page()
+            await page.goto(nxt, timeout=60000)
+            found = await _discover_from_page(page)
+            if found:
+                return found
+
+        return None
+    finally:
         try:
-            await page.goto(url, timeout=60_000)
-            try:
-                await page.wait_for_load_state("domcontentloaded", timeout=10_000)
-            except PlaywrightTimeoutError:
-                pass
+            await page.close()
+        except Exception:
+            pass
 
-            await _dump_links(f"D{depth}", page)
-
-            # intento directo de descarga en esta página
-            name = await _try_download_from_page(page, download_dir)
-            if name:
-                downloads += 1
-                # actualiza última descarga visible en progreso
-                await progreso.inc_done(last_file=name)
-
-            # recolecta nuevos diálogos para profundizar
-            if depth < max_depth:
-                modal_links = page.locator('a[href^="#action$a-dialog-open?"]')
-                n = await modal_links.count()
-                for i in range(n):
-                    href = await modal_links.nth(i).get_attribute("href")
-                    real = _decode_dialog_url(href or "")
-                    if real:
-                        to_visit.append((real, depth + 1))
-        finally:
-            try:
-                await page.close()
-            except Exception:
-                pass
-
-    return downloads
 
 # ============================
 #  API para routes.py
@@ -388,14 +437,23 @@ async def cancel_descarga() -> bool:
     _cancel_event.set()
     return True
 
+
 # ============================
 #  Flujo principal de descarga
 # ============================
+# ⚠️ En SIGED Reloaded (servidor x86), esta función ahora hace:
+#   1) discovery/manifest (backend)  -> progreso.status="descubriendo"
+#   2) espera descargas del cliente  -> progreso.status="esperando_descarga_cliente"
+# El frontend se encargará de descargar a la PC del usuario y reportar progreso por API.
 
 async def descargar_documentos(url: str) -> None:
     """
-    Flujo principal de descarga. Actualiza `progreso`.
+    Flujo principal (backend). Actualiza `progreso`.
     Respeta cancelación (_cancel_event).
+
+    Nuevo comportamiento:
+    - NO escribe archivos en disco.
+    - Descubre lista de adjuntos (name + download_url).
     """
     await progreso.reset(url=url)
 
@@ -405,19 +463,8 @@ async def descargar_documentos(url: str) -> None:
 
     await progreso.start(url)
 
-    # base de descarga configurable
-    ruta_descarga_base = _get_download_base()
-    ruta_descarga = ruta_descarga_base / "SIGED_DOCUMENTOS"
-    try:
-        ruta_descarga.mkdir(parents=True, exist_ok=True)
-    except Exception as e:
-        await progreso.set_error(f"No se pudo crear carpeta de descarga: {e}")
-        return
-
     HEADLESS = os.getenv("SIGED_HEADLESS", "0") == "1"
     GOTO_TIMEOUT_MS = int(os.getenv("SIGED_GOTO_TIMEOUT_MS", "90000"))
-    FILE_TIMEOUT_MS = int(os.getenv("SIGED_FILE_TIMEOUT_MS", "30000"))
-    RETRIES = int(os.getenv("SIGED_FILE_RETRIES", "2"))
 
     try:
         async with async_playwright() as p:
@@ -430,8 +477,8 @@ async def descargar_documentos(url: str) -> None:
                 ],
             )
             context = await browser.new_context(
-                accept_downloads=True,
-                user_agent=("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                accept_downloads=False,  # ya no usamos downloads del servidor
+                user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                             "AppleWebKit/537.36 (KHTML, like Gecko) "
                             "Chrome/124.0.0.0 Safari/537.36"),
                 locale="es-CR",
@@ -447,7 +494,6 @@ async def descargar_documentos(url: str) -> None:
                 return
 
             # Localiza los enlaces 'Ver Documento' (hash-dialog)
-            # Nota: hacemos el filtro por prefijo; el título puede variar, así que no forzamos.
             doc_links = page.locator('a[href^="#action$a-dialog-open?"]')
             total = await doc_links.count()
             if total == 0:
@@ -467,22 +513,20 @@ async def descargar_documentos(url: str) -> None:
                 href = await doc_links.nth(i).get_attribute("href")
                 real = _decode_dialog_url(href or "")
                 if not real:
-                    # No se pudo decodificar: contamos como atendido sin archivo
-                    await progreso.inc_done(last_file=f"(no decodificado {i+1})")
+                    await progreso.inc_discovered_placeholder(f"(no decodificado {i+1})")
                     continue
 
-                # Explora la cadena de diálogos hasta 3 niveles y trata de descargar
-                # Cada archivo descargado actualizará progreso.inc_done(last_file=...)
-                before = progreso.done
-                _ = await _crawl_dialog_chain(context, real, ruta_descarga, max_depth=3)
-                after = progreso.done
-
-                # Si no se descargó nada dentro de la cadena, igualmente marcamos el doc como atendido
-                if after == before:
-                    await progreso.inc_done(last_file=f"(sin archivo {i+1})")
+                found = await _crawl_dialog_chain(context, real, max_depth=3)
+                if found:
+                    name, durl = found
+                    await progreso.add_discovered(name=name, url=durl)
+                else:
+                    await progreso.inc_discovered_placeholder(f"(sin archivo {i+1})")
 
             await browser.close()
-            await progreso.set_finalizado()
+
+            # Pasamos a fase: esperar que el cliente descargue secuencialmente
+            await progreso.set_waiting_client()
 
     except Exception as e:
         await progreso.set_error(f"Fallo inesperado: {e}")

@@ -15,6 +15,10 @@ class URLRequest(BaseModel):
     url: str
 
 
+class ClienteDownloadedRequest(BaseModel):
+    filename: str = ""
+
+
 @router.post("/descargar")
 async def descargar_archivos(req: URLRequest):
     url = (req.url or "").strip()
@@ -39,6 +43,31 @@ async def descargar_archivos(req: URLRequest):
 @router.get("/progreso")
 async def obtener_progreso():
     return progreso.to_dict()
+
+
+# 🔹 NUEVO: retorna el manifest (lista de archivos descubiertos)
+@router.get("/archivos")
+async def obtener_archivos():
+    """
+    Devuelve la lista de archivos descubiertos por el backend:
+      [{"name": "...", "url": "https://..."}]
+    Nota: esto NO descarga nada en el servidor; el frontend descargará en el cliente.
+    """
+    return {"ok": True, "files": progreso.files}
+
+
+# 🔹 NUEVO: el cliente reporta que descargó 1 archivo (para progreso combinado A)
+@router.post("/cliente/descargado")
+async def cliente_descargado(req: ClienteDownloadedRequest):
+    await progreso.report_client_downloaded(filename=(req.filename or "").strip())
+    return {"ok": True}
+
+
+# 🔹 NUEVO: el cliente marca finalizado (opcional, pero recomendado)
+@router.post("/cliente/finalizar")
+async def cliente_finalizar():
+    await progreso.set_finalizado()
+    return {"ok": True}
 
 
 @router.post("/cancelar")
