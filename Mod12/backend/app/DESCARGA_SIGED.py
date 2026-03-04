@@ -1,3 +1,4 @@
+# app/DESCARGA_SIGED.py
 import os
 import re
 import asyncio
@@ -422,12 +423,47 @@ def _can_start() -> bool:
 def is_running() -> bool:
     return (_current_task is not None) and (not _current_task.done())
 
+def _on_task_done(task: asyncio.Task) -> None:
+    """
+    Blindaje:
+    - Limpia referencia global cuando termina.
+    - Si explotó con excepción, setea error en progreso (sin tumbar el server).
+    """
+    global _current_task
+    _current_task = None
+    try:
+        exc = task.exception()
+        if exc is not None:
+            # No podemos "await" aquí; lanzamos una tarea para set_error.
+            asyncio.create_task(progreso.set_error(f"Fallo inesperado: {exc}"))
+    except asyncio.CancelledError:
+        # Cancelled: estado lo setea cancel_descarga / worker.
+        pass
+    except Exception as e:
+        asyncio.create_task(progreso.set_error(f"Fallo inesperado: {e}"))
+
 async def start_download_if_free(url: str) -> bool:
+    """
+    Blindaje + Fix del "reset":
+    - El reset/start ocurre SOLO aquí (cuando el endpoint acepta iniciar).
+    - El worker NO resetea el estado.
+    """
     global _current_task
     if not _can_start():
         return False
+
+    # Prepara estado (una sola vez por corrida)
+    await progreso.reset(url=url)
+
+    if not _is_allowed_url(url):
+        await progreso.set_error("URL inválida o dominio no permitido (cgrweb.cgr.go.cr).")
+        return True  # aceptamos la llamada pero deja error listo para UI
+
+    await progreso.start(url)
+
     _cancel_event.clear()
     _current_task = asyncio.create_task(descargar_documentos(url))
+    _current_task.add_done_callback(_on_task_done)
     return True
 
 async def cancel_descarga() -> bool:
@@ -454,16 +490,13 @@ async def descargar_documentos(url: str) -> None:
     Nuevo comportamiento:
     - NO escribe archivos en disco.
     - Descubre lista de adjuntos (name + download_url).
+
+    Nota importante (blindaje):
+    - reset/start YA se hicieron en start_download_if_free().
+    - Este worker asume que el estado ya está preparado.
     """
-    await progreso.reset(url=url)
-
-    if not _is_allowed_url(url):
-        await progreso.set_error("URL inválida o dominio no permitido (cgrweb.cgr.go.cr).")
-        return
-
-    await progreso.start(url)
-
-    HEADLESS = os.getenv("SIGED_HEADLESS", "0") == "1"
+    # Headless: por defecto "1" (servidor/x86 no tiene UI)
+    HEADLESS = os.getenv("SIGED_HEADLESS", "1") == "1"
     GOTO_TIMEOUT_MS = int(os.getenv("SIGED_GOTO_TIMEOUT_MS", "90000"))
 
     try:

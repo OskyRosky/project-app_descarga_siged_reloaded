@@ -1,3 +1,4 @@
+# app/routes.py
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
@@ -5,7 +6,7 @@ from app.DESCARGA_SIGED import (
     start_download_if_free,
     cancel_descarga,
     is_running,
-    progreso,  # contiene el estado y el método reset()
+    progreso,
 )
 
 router = APIRouter()
@@ -33,6 +34,7 @@ async def descargar_archivos(req: URLRequest):
     if is_running():
         raise HTTPException(status_code=409, detail="Ya hay una descarga en curso")
 
+    # Start (ahora hace el reset/start adentro + blindaje)
     ok = await start_download_if_free(url)
     if not ok:
         raise HTTPException(status_code=409, detail="Ya hay una descarga en curso")
@@ -45,7 +47,7 @@ async def obtener_progreso():
     return progreso.to_dict()
 
 
-# 🔹 NUEVO: retorna el manifest (lista de archivos descubiertos)
+# 🔹 retorna el manifest (lista de archivos descubiertos)
 @router.get("/archivos")
 async def obtener_archivos():
     """
@@ -56,14 +58,14 @@ async def obtener_archivos():
     return {"ok": True, "files": progreso.files}
 
 
-# 🔹 NUEVO: el cliente reporta que descargó 1 archivo (para progreso combinado A)
+# 🔹 el cliente reporta que descargó 1 archivo (para progreso combinado A)
 @router.post("/cliente/descargado")
 async def cliente_descargado(req: ClienteDownloadedRequest):
     await progreso.report_client_downloaded(filename=(req.filename or "").strip())
     return {"ok": True}
 
 
-# 🔹 NUEVO: el cliente marca finalizado (opcional, pero recomendado)
+# 🔹 el cliente marca finalizado (opcional, pero recomendado)
 @router.post("/cliente/finalizar")
 async def cliente_finalizar():
     await progreso.set_finalizado()
@@ -78,9 +80,13 @@ async def cancelar():
     return {"ok": True, "message": "Cancelación solicitada"}
 
 
-# 🔹 NUEVO: resetear el estado en el backend para arrancar “limpio”
+# 🔹 resetear el estado en el backend para arrancar “limpio”
 @router.post("/reset")
 async def reset_progreso():
-    # No pasamos URL → vuelve a "inicio", contadores en cero.
+    """
+    Reset manual.
+    Nota: si hay una corrida activa, esto solo limpia el estado visual,
+    pero NO detiene Playwright. Para eso usar /cancelar.
+    """
     await progreso.reset()
     return {"ok": True}
