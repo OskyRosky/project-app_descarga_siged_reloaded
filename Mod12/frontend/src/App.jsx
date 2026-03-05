@@ -1,5 +1,3 @@
-// App.jsx
-
 import { useEffect, useRef, useState } from "react";
 import "./App.css";
 
@@ -11,7 +9,11 @@ import "./App.css";
 const API_BASE = import.meta.env.VITE_API_BASE ?? "";
 const api = (path) => (API_BASE ? `${API_BASE}${path}` : path);
 
+// Subcarpeta fija que SIEMPRE se crea dentro de la carpeta elegida
 const SIGED_SUBFOLDER = "SIGED_DOCUMENTOS";
+
+// Polling (ms)
+const POLL_MS = 800;
 
 /**
  * ============================================================
@@ -63,7 +65,15 @@ export default function App() {
    * ------------------------------------------------------------
    * UI STATE
    * ------------------------------------------------------------
-   * uiState: inicio | iniciando | descubriendo | descargando_cliente | finalizado | error | cancelado
+   * uiState:
+   *  - inicio
+   *  - iniciando
+   *  - descubriendo
+   *  - descargando_cliente
+   *  - confirmando_backend   (descarga cliente terminó, esperando backend finalizado)
+   *  - finalizado
+   *  - error
+   *  - cancelado
    */
   const [uiState, setUiState] = useState("inicio");
   const [msg, setMsg] = useState("");
@@ -72,7 +82,13 @@ export default function App() {
    * ------------------------------------------------------------
    * BACKEND SNAPSHOT (UN SOLO STATE)
    * ------------------------------------------------------------
-   * status: inicio | descubriendo | esperando_descarga_cliente | error | cancelado | finalizado
+   * status:
+   *  - inicio
+   *  - descubriendo
+   *  - esperando_descarga_cliente
+   *  - error
+   *  - cancelado
+   *  - finalizado
    */
   const [snapshot, setSnapshot] = useState({
     status: "inicio",
@@ -86,10 +102,6 @@ export default function App() {
     files_count: 0,
   });
 
-  /**
-   * Helper para aplicar snapshot con defaults seguros.
-   * (Evita repetir setX(data.x ?? default) por todo lado)
-   */
   function applySnapshot(data) {
     setSnapshot((prev) => ({
       ...prev,
@@ -130,7 +142,7 @@ export default function App() {
 
   function startPolling() {
     stopPolling();
-    pollingRef.current = setInterval(fetchProgreso, 800);
+    pollingRef.current = setInterval(fetchProgreso, POLL_MS);
   }
 
   /**
@@ -150,10 +162,9 @@ export default function App() {
       const res = await fetch(api("/progreso"));
       const data = await res.json();
 
-      // 1) aplicar snapshot
       applySnapshot(data);
 
-      // 2) reglas de UI según backend
+      // Manejo de estados terminales del backend
       if (data.status === "error") {
         setUiState("error");
         const base = data.last_error || "Error en la descarga.";
@@ -177,13 +188,14 @@ export default function App() {
         return;
       }
 
+      // Estados no terminales
       if (data.status === "descubriendo") {
-        setUiState("descubriendo");
+        setUiState((prev) => (prev === "confirmando_backend" ? prev : "descubriendo"));
         return;
       }
 
       if (data.status === "esperando_descarga_cliente") {
-        // seguimos polling durante descargas cliente
+        // seguimos polling mientras el cliente descarga o mientras confirmamos backend
         return;
       }
     } catch {
@@ -212,7 +224,6 @@ export default function App() {
     setUiState("inicio");
     setMsg("");
 
-    // reset snapshot completo
     setSnapshot({
       status: "inicio",
       phase: "idle",
@@ -234,6 +245,7 @@ export default function App() {
    * ============================================================
    *  PICK FOLDER (opción 2)
    * ============================================================
+   * Pide seleccionar una carpeta y luego crea SIGED_DOCUMENTOS dentro.
    */
   async function pickFolder() {
     setMsg("");
@@ -250,6 +262,7 @@ export default function App() {
       folderHandleRef.current = baseHandle;
       setPickedFolderLabel(baseHandle.name || "Carpeta seleccionada");
 
+      // Siempre creamos/obtenemos SIGED_DOCUMENTOS dentro
       const sigedDir = await baseHandle.getDirectoryHandle(SIGED_SUBFOLDER, { create: true });
       sigedDirHandleRef.current = sigedDir;
 
@@ -271,17 +284,19 @@ export default function App() {
 
     if (!isValidSigedUrl(url)) {
       setUiState("error");
-      setMsg(withAdvice("URL inválida. Debe ser de cgrweb.cgr.go.cr con CORRESPONDENCIA:1 y P1_CONSECUTIVO."));
+      setMsg(
+        withAdvice("URL inválida. Debe ser de cgrweb.cgr.go.cr con CORRESPONDENCIA:1 y P1_CONSECUTIVO.")
+      );
       return;
     }
 
-    // opción 2: pedir carpeta antes
+    // Pedimos carpeta antes de iniciar backend (opción 2)
     const okFolder = await pickFolder();
     if (!okFolder) return;
 
     setUiState("iniciando");
 
-    // reset contadores para UI limpia (sin tocar backend)
+    // Reset visual (front)
     setSnapshot((prev) => ({
       ...prev,
       total: 0,
@@ -327,8 +342,10 @@ export default function App() {
 
   /**
    * ============================================================
-   *  DESCARGA 1 ARCHIVO (via /proxy) -> a SIGED_DOCUMENTOS
+   *  DESCARGA 1 ARCHIVO (via /proxy) -> SIGED_DOCUMENTOS
    * ============================================================
+   * Importante: escribimos por chunks y cerramos explícitamente el archivo
+   * antes de reportar /cliente/descargado (reduce desfases y “partial writes”).
    */
   async function downloadOneFileViaProxy(fileObj) {
     const sigedDir = sigedDirHandleRef.current;
@@ -338,8 +355,7 @@ export default function App() {
     const targetUrl = fileObj.url;
 
     const proxyUrl =
-      api("/proxy") +
-      `?url=${encodeURIComponent(targetUrl)}&name=${encodeURIComponent(fileName)}`;
+      api("/proxy") + `?url=${encodeURIComponent(targetUrl)}&name=${encodeURIComponent(fileName)}`;
 
     const resp = await fetch(proxyUrl);
     if (!resp.ok) {
@@ -351,13 +367,22 @@ export default function App() {
     const writable = await fileHandle.createWritable();
 
     try {
-      if (resp.body) {
-        await resp.body.pipeTo(writable);
-      } else {
+      if (!resp.body) {
+        // fallback blob
         const blob = await resp.blob();
         await writable.write(blob);
         await writable.close();
+        return;
       }
+
+      // stream manual -> close garantizado
+      const reader = resp.body.getReader();
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        if (value) await writable.write(value);
+      }
+      await writable.close();
     } catch (e) {
       try {
         await writable.abort();
@@ -370,14 +395,14 @@ export default function App() {
    * ============================================================
    *  FALLBACK: descarga a "Downloads" del navegador
    * ============================================================
+   * (Sin control de carpeta)
    */
   async function fallbackDownloadInBrowser(fileObj) {
     const fileName = fileObj.name || "archivo";
     const targetUrl = fileObj.url;
 
     const proxyUrl =
-      api("/proxy") +
-      `?url=${encodeURIComponent(targetUrl)}&name=${encodeURIComponent(fileName)}`;
+      api("/proxy") + `?url=${encodeURIComponent(targetUrl)}&name=${encodeURIComponent(fileName)}`;
 
     const resp = await fetch(proxyUrl);
     if (!resp.ok) throw new Error(`Proxy HTTP ${resp.status}`);
@@ -418,8 +443,8 @@ export default function App() {
         throw new Error("Backend no devolvió archivos en /archivos.");
       }
 
+      // Descarga secuencial 1-a-1
       for (const f of files) {
-        // solo UI: mostrar último archivo
         setSnapshot((prev) => ({ ...prev, last_file: f.name || "" }));
 
         if (supportsDirectoryPicker()) {
@@ -428,6 +453,7 @@ export default function App() {
           await fallbackDownloadInBrowser(f);
         }
 
+        // Reportar al backend solo cuando el archivo ya fue escrito/cerrado
         await fetch(api("/cliente/descargado"), {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -435,10 +461,15 @@ export default function App() {
         });
       }
 
+      // Pedimos al backend marcar finalizado
       await fetch(api("/cliente/finalizar"), { method: "POST" });
 
-      setUiState("finalizado");
-      stopPolling();
+      // CLAVE: NO ponemos "finalizado" aquí todavía.
+      // Pasamos a "confirmando_backend" y mantenemos polling hasta que /progreso.status === "finalizado".
+      setUiState("confirmando_backend");
+
+      // Asegura que el polling siga vivo (por si alguien lo detuvo)
+      startPolling();
     } catch (e) {
       setUiState("error");
       setMsg(`Error en descarga del cliente: ${String(e)}`);
@@ -516,7 +547,8 @@ export default function App() {
   const busy =
     uiState === "iniciando" ||
     uiState === "descubriendo" ||
-    uiState === "descargando_cliente";
+    uiState === "descargando_cliente" ||
+    uiState === "confirmando_backend";
 
   /**
    * ============================================================
@@ -526,6 +558,27 @@ export default function App() {
   return (
     <div className="container">
       <h1>Módulo de descarga de documentos en el SIGED.</h1>
+
+      <div style={{ marginBottom: 14, padding: 12, borderRadius: 8, background: "rgba(255,255,255,0.04)" }}>
+        <p style={{ marginTop: 0, marginBottom: 8 }}>
+          <strong>Antes de iniciar:</strong>
+        </p>
+        <ul style={{ marginTop: 0 }}>
+          <li>✅ Solo se permiten enlaces del tipo <strong>cgrweb.cgr.go.cr</strong>.</li>
+          <li>📁 Debe seleccionar una carpeta destino. Dentro se creará <strong>{SIGED_SUBFOLDER}</strong>.</li>
+          <li>
+            ⚠️ No seleccione carpetas “raíz” o sensibles (por ejemplo: Descargas, raíz del disco, etc.). Si el navegador detecta <em>system files</em>,
+            aparecerá una advertencia. Cree una carpeta nueva y seleccione esa.
+          </li>
+          <li>
+            🔒 La primera vez el navegador pedirá permiso de escritura en la carpeta seleccionada. Para continuar, debe presionar <strong>Permitir</strong> o <strong>Allow</strong>.
+          </li>
+          <li>
+            ⏱️ Puede existir un desfase visual de <strong> 15 a 30 segundos </strong> entre el progreso mostrado por  la AppSIGED y la carpeta de descarga de los documetos.
+            Aun así, el sistema descargará todos los documentos contenidos en el enlace.
+          </li>
+        </ul>
+      </div>
 
       <form onSubmit={handleStart}>
         <label>🔗 URL del SIGED:</label>
@@ -541,9 +594,8 @@ export default function App() {
         />
         <br />
 
-        <p style={{ fontStyle: "italic", color: "gray" }}>
-          📁 Se te pedirá elegir una carpeta. Dentro se creará{" "}
-          <strong>{SIGED_SUBFOLDER}</strong> y ahí se guardarán los archivos.
+        <p style={{ fontStyle: "italic", color: "gray", marginTop: 10 }}>
+          📁 Se te pedirá elegir una carpeta. Dentro se creará <strong>{SIGED_SUBFOLDER}</strong> y ahí se guardarán los archivos.
         </p>
 
         <button type="submit" disabled={busy}>
@@ -612,6 +664,12 @@ export default function App() {
         {snapshot.status === "esperando_descarga_cliente" ? (
           <p style={{ marginTop: 8, opacity: 0.9 }}>
             ✅ Archivos descubiertos. Iniciando descargas 1-a-1…
+          </p>
+        ) : null}
+
+        {uiState === "confirmando_backend" ? (
+          <p style={{ marginTop: 8, opacity: 0.9 }}>
+            ⏳ Descarga cliente completada. Confirmando finalización con el backend…
           </p>
         ) : null}
 
