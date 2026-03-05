@@ -1,12 +1,9 @@
 # app/routes.py
-from __future__ import annotations
-
-import re
 from typing import Optional
-from urllib.parse import urlparse, quote
+from urllib.parse import unquote, urlparse
 
 import httpx
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
@@ -19,44 +16,6 @@ from app.DESCARGA_SIGED import (
 
 router = APIRouter()
 
-# ============================
-# Helpers de seguridad / SSRF
-# ============================
-
-_ALLOWED_HOST = "cgrweb.cgr.go.cr"
-
-
-def _is_allowed_remote_url(raw: str) -> bool:
-    try:
-        u = urlparse(raw.strip())
-        if u.scheme not in ("http", "https"):
-            return False
-        host = (u.hostname or "").lower()
-        return host == _ALLOWED_HOST
-    except Exception:
-        return False
-
-
-def _sanitize_filename(name: str) -> str:
-    name = (name or "archivo").strip()
-    # evita path traversal
-    name = name.replace("\\", "_").replace("/", "_")
-    # caracteres inválidos en Windows/macOS
-    name = re.sub(r'[<>:"/\\|?*\x00-\x1F]+', "_", name).strip()
-    return name or "archivo"
-
-
-def _content_disposition_attachment(filename: str) -> str:
-    """
-    Usa filename* UTF-8 para soportar acentos/espacios.
-    """
-    safe = _sanitize_filename(filename)
-    return f"attachment; filename*=UTF-8''{quote(safe)}"
-
-
-# ============================
-# Modelos
-# ============================
 
 class URLRequest(BaseModel):
     url: str
@@ -66,15 +25,19 @@ class ClienteDownloadedRequest(BaseModel):
     filename: str = ""
 
 
-# ============================
-# Endpoints existentes
-# ============================
+def _is_allowed_proxy_url(raw_url: str) -> bool:
+    try:
+        u = urlparse(raw_url)
+        host = (u.netloc or "").lower()
+        return u.scheme in ("http", "https") and host.endswith("cgrweb.cgr.go.cr")
+    except Exception:
+        return False
+
 
 @router.post("/descargar")
 async def descargar_archivos(req: URLRequest):
     url = (req.url or "").strip()
 
-    # Validaciones rápidas (coinciden con la UX actual)
     if not url.lower().startswith(("http://", "https://")):
         raise HTTPException(status_code=400, detail="URL inválida: debe comenzar con http o https")
     if "cgrweb.cgr.go.cr" not in url.lower():
@@ -97,11 +60,6 @@ async def obtener_progreso():
 
 @router.get("/archivos")
 async def obtener_archivos():
-    """
-    Devuelve la lista de archivos descubiertos por el backend:
-      [{"name": "...", "url": "https://..."}]
-    Nota: esto NO descarga nada en el servidor; el frontend descargará en el cliente.
-    """
     return {"ok": True, "files": progreso.files}
 
 
@@ -127,66 +85,62 @@ async def cancelar():
 
 @router.post("/reset")
 async def reset_progreso():
-    """
-    Reset manual.
-    Nota: si hay una corrida activa, esto solo limpia el estado visual,
-    pero NO detiene Playwright. Para eso usar /cancelar.
-    """
     await progreso.reset()
     return {"ok": True}
 
 
-# ============================
-# NUEVO: Proxy streaming (anti-CORS)
-# ============================
+@router.api_route("/proxy", methods=["GET", "HEAD"])
+async def proxy(request: Request, url: str, name: Optional[str] = None):
+    target_url = unquote((url or "").strip())
 
-@router.get("/proxy")
-async def proxy_descarga(
-    url: str = Query(..., description="URL remoto (solo cgrweb.cgr.go.cr)"),
-    name: Optional[str] = Query(None, description="Nombre sugerido para guardar"),
-):
-    """
-    Stream del archivo remoto hacia el cliente:
-    - NO guarda en disco del servidor
-    - Evita CORS (porque el navegador llama a este endpoint del backend)
-    - Permite fijar nombre con Content-Disposition
+    if not target_url:
+        raise HTTPException(status_code=400, detail="Falta parámetro url")
 
-    Seguridad:
-    - Allowlist estricta al host cgrweb.cgr.go.cr (anti-SSRF)
-    """
-    url = (url or "").strip()
-    if not _is_allowed_remote_url(url):
-        raise HTTPException(status_code=400, detail="URL no permitida para proxy (solo cgrweb.cgr.go.cr).")
+    if not _is_allowed_proxy_url(target_url):
+        raise HTTPException(status_code=400, detail="URL no permitida para proxy (solo cgrweb.cgr.go.cr)")
 
-    filename = _sanitize_filename(name or "archivo")
-    cd = _content_disposition_attachment(filename)
+    incoming_range = request.headers.get("range")
+    incoming_if_modified = request.headers.get("if-modified-since")
+    incoming_if_none_match = request.headers.get("if-none-match")
 
-    # Timeouts razonables para stream
-    timeout = httpx.Timeout(connect=15.0, read=60.0, write=15.0, pool=15.0)
+    headers = {}
+    if incoming_range:
+        headers["range"] = incoming_range
+    if incoming_if_modified:
+        headers["if-modified-since"] = incoming_if_modified
+    if incoming_if_none_match:
+        headers["if-none-match"] = incoming_if_none_match
 
-    try:
-        async with httpx.AsyncClient(follow_redirects=True, timeout=timeout) as client:
-            # stream GET
-            resp = await client.get(url)
-            if resp.status_code >= 400:
-                raise HTTPException(status_code=resp.status_code, detail=f"Proxy error HTTP {resp.status_code}")
+    timeout = httpx.Timeout(connect=20.0, read=120.0, write=20.0, pool=20.0)
 
-            content_type = resp.headers.get("content-type") or "application/octet-stream"
+    async with httpx.AsyncClient(follow_redirects=True, timeout=timeout) as client:
+        try:
+            if request.method == "HEAD":
+                r = await client.head(target_url, headers=headers)
+                out_headers = {}
+                for k in ("content-type", "content-disposition", "content-length", "accept-ranges", "etag", "last-modified"):
+                    if k in r.headers:
+                        out_headers[k] = r.headers[k]
+                if name and "content-disposition" not in out_headers:
+                    safe = name.replace('"', "")
+                    out_headers["content-disposition"] = f'attachment; filename="{safe}"'
+                return StreamingResponse(iter([b""]), status_code=r.status_code, headers=out_headers)
 
-            async def iter_bytes():
-                async for chunk in resp.aiter_bytes():
+            r = await client.stream("GET", target_url, headers=headers)
+
+            out_headers = {}
+            for k in ("content-type", "content-disposition", "content-length", "accept-ranges", "etag", "last-modified"):
+                if k in r.headers:
+                    out_headers[k] = r.headers[k]
+            if name and "content-disposition" not in out_headers:
+                safe = name.replace('"', "")
+                out_headers["content-disposition"] = f'attachment; filename="{safe}"'
+
+            async def _aiter():
+                async for chunk in r.aiter_bytes(chunk_size=1024 * 256):
                     yield chunk
 
-            headers = {
-                "Content-Disposition": cd,
-                # Si el upstream manda content-length lo pasamos (no siempre viene)
-            }
-            if "content-length" in resp.headers:
-                headers["Content-Length"] = resp.headers["content-length"]
+            return StreamingResponse(_aiter(), status_code=r.status_code, headers=out_headers)
 
-            return StreamingResponse(iter_bytes(), media_type=content_type, headers=headers)
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Proxy fallo: {e}")
+        except httpx.RequestError as e:
+            raise HTTPException(status_code=502, detail=f"Proxy error: {type(e).__name__}")
