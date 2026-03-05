@@ -1,24 +1,15 @@
-// Importamos los hooks de React y el CSS principal
+// App.jsx
 import { useEffect, useRef, useState } from "react";
 import "./App.css";
 
 /* ======================================================
    🔧 CONFIGURACIÓN DEL API BACKEND
-   ------------------------------------------------------
-   - Si definimos VITE_API_BASE, la usamos (p.ej. http://127.0.0.1:8210)
-   - Si no existe, usamos el mismo origen donde se sirva el frontend (Vite proxy)
 ====================================================== */
 const API_BASE = import.meta.env.VITE_API_BASE ?? "";
 const api = (path) => (API_BASE ? `${API_BASE}${path}` : path);
 
 /* ======================================================
    ✅ VALIDACIÓN DE URL DEL SIGED
-   ------------------------------------------------------
-   Verifica:
-   - http/https
-   - dominio exacto: cgrweb.cgr.go.cr
-   - ruta que empiece con /apex/f
-   - que el query/hash contenga p=CORRESPONDENCIA:1 y P1_CONSECUTIVO (32 hex)
 ====================================================== */
 function isValidSigedUrl(raw) {
   try {
@@ -36,40 +27,49 @@ function isValidSigedUrl(raw) {
   }
 }
 
-/* ======================================================
-   📝 Utilidad: agrega consejo al final de mensajes
-====================================================== */
 function withAdvice(msg) {
   return `${msg} Por favor verifique de nuevo el enlace para poder descargar los archivos y vuelva a intentarlo.`;
 }
 
 /* ======================================================
-   🧼 Sanitizar nombre de archivo (cliente)
+   🧼 Sanitizar nombre archivo (cliente)
 ====================================================== */
 function sanitizeFilename(name) {
   const base = (name || "archivo").trim();
-  // Evita caracteres problemáticos en Windows/macOS
   return base.replace(/[<>:"/\\|?*\x00-\x1F]/g, "_");
 }
 
 /* ======================================================
-   📁 “Carpeta” lógica: prefijo en filename
-   Nota: navegador NO puede crear carpetas automáticamente.
+   🧠 FS Access helpers (Chrome/Edge)
 ====================================================== */
-const DOWNLOAD_PREFIX = "SIGED_DOCUMENTOS__";
+function hasFileSystemAccessAPI() {
+  return typeof window !== "undefined" && "showDirectoryPicker" in window;
+}
+
+async function ensureSubdirSIGED(rootDirHandle) {
+  // Crea/usa subcarpeta SIGED_DOCUMENTOS
+  return await rootDirHandle.getDirectoryHandle("SIGED_DOCUMENTOS", { create: true });
+}
+
+async function writeBlobToFile(dirHandle, filename, blob) {
+  const safe = sanitizeFilename(filename);
+  const fileHandle = await dirHandle.getFileHandle(safe, { create: true });
+  const writable = await fileHandle.createWritable();
+  await writable.write(blob);
+  await writable.close();
+}
 
 /* ======================================================
    🎯 COMPONENTE PRINCIPAL
 ====================================================== */
 export default function App() {
-  // --- ESTADOS PRINCIPALES ---
   const [url, setUrl] = useState("");
 
-  // Estados UI (alineados a backend nuevo)
-  // inicio | iniciando… | descubriendo | descargando_cliente | finalizado | error | cancelado
+  // UI status (mapeado al backend)
+  // inicio | iniciando… | descubriendo | esperando_descarga_cliente | descargando_cliente | finalizado | error | cancelado
   const [status, setStatus] = useState("inicio");
 
-  // Progreso backend (discovery + client)
+  // Progreso (backend combinado)
   const [total, setTotal] = useState(0);
   const [discoveredDone, setDiscoveredDone] = useState(0);
   const [clientDone, setClientDone] = useState(0);
@@ -79,19 +79,20 @@ export default function App() {
 
   // Manifest
   const [files, setFiles] = useState([]); // [{name,url}]
-  const [downloading, setDownloading] = useState(false);
+  const [downloadingClient, setDownloadingClient] = useState(false);
 
-  // Control del polling
+  // Carpeta (File System Access API)
+  const [fsSupported] = useState(hasFileSystemAccessAPI());
+  const [rootDirHandle, setRootDirHandle] = useState(null);
+  const [sigedDirHandle, setSigedDirHandle] = useState(null);
+
+  // Polling / control
   const pollingRef = useRef(null);
-
-  // Control de descarga cliente (cancelable)
   const clientAbortRef = useRef(null);
-
-  // Evita arrancar la descarga cliente dos veces
   const clientLoopStartedRef = useRef(false);
 
   /* ======================================================
-     ⏱️ CONTROL DEL POLLING
+     ⏱️ POLLING
   ====================================================== */
   function stopPolling() {
     if (pollingRef.current) {
@@ -104,9 +105,6 @@ export default function App() {
     pollingRef.current = setInterval(fetchProgreso, 800);
   }
 
-  /* ======================================================
-     🧯 Cancelar loop de descargas cliente (local)
-  ====================================================== */
   function abortClientDownloads() {
     if (clientAbortRef.current) {
       try {
@@ -115,11 +113,11 @@ export default function App() {
       clientAbortRef.current = null;
     }
     clientLoopStartedRef.current = false;
-    setDownloading(false);
+    setDownloadingClient(false);
   }
 
   /* ======================================================
-     📡 CONSULTAR PROGRESO
+     📦 API calls
   ====================================================== */
   async function fetchProgreso() {
     try {
@@ -132,8 +130,9 @@ export default function App() {
       setPercent(data.percent ?? 0);
       setLastFile(data.last_file || "");
 
-      // ---- estados backend: inicio | descubriendo | esperando_descarga_cliente | finalizado | error | cancelado
-      if (data.status === "error") {
+      const st = data.status;
+
+      if (st === "error") {
         setStatus("error");
         const base = data.last_error || "Error en el proceso.";
         const needsAdvice =
@@ -145,7 +144,7 @@ export default function App() {
         return;
       }
 
-      if (data.status === "cancelado") {
+      if (st === "cancelado") {
         setStatus("cancelado");
         setMsg("");
         stopPolling();
@@ -153,7 +152,7 @@ export default function App() {
         return;
       }
 
-      if (data.status === "finalizado" || (data.percent ?? 0) >= 100) {
+      if (st === "finalizado" || (data.percent ?? 0) >= 100) {
         setStatus("finalizado");
         setMsg("");
         stopPolling();
@@ -161,17 +160,17 @@ export default function App() {
         return;
       }
 
-      if (data.status === "descubriendo") {
+      if (st === "descubriendo") {
         setStatus("descubriendo");
         return;
       }
 
-      if (data.status === "esperando_descarga_cliente") {
-        // Backend listo -> si todavía no arrancamos el cliente, arrancamos
+      if (st === "esperando_descarga_cliente") {
+        setStatus("esperando_descarga_cliente");
+        // Arrancar loop cliente UNA sola vez
         if (!clientLoopStartedRef.current) {
           setStatus("descargando_cliente");
           await ensureManifestLoaded();
-          // Arrancar loop cliente (no bloquea UI)
           startClientDownloadLoop();
         } else {
           setStatus("descargando_cliente");
@@ -179,7 +178,7 @@ export default function App() {
         return;
       }
 
-      // data.status === "inicio" -> no hacemos nada agresivo
+      // inicio u otros
     } catch {
       setStatus("error");
       setMsg("⚠️ Error consultando progreso");
@@ -188,130 +187,166 @@ export default function App() {
     }
   }
 
-  /* ======================================================
-     📦 Cargar manifest (/archivos)
-  ====================================================== */
   async function ensureManifestLoaded() {
     try {
       const res = await fetch(api("/archivos"));
       const data = await res.json();
-      if (res.ok && data.ok) {
-        const list = Array.isArray(data.files) ? data.files : [];
-        setFiles(list);
-        return list;
+      if (res.ok && data.ok && Array.isArray(data.files)) {
+        setFiles(data.files);
+        return data.files;
       }
+      setFiles([]);
       return [];
     } catch {
+      setFiles([]);
       return [];
     }
   }
 
-  /* ======================================================
-     ⬇️ Descargar 1 archivo en cliente (cualquier extensión)
-  ====================================================== */
-  async function downloadOneFile(file, signal) {
-    // file: {name,url}
-    const rawName = sanitizeFilename(file?.name || "archivo");
-    const filename = `${DOWNLOAD_PREFIX}${rawName}`;
+  async function reportClientDownloaded(filename) {
+    try {
+      await fetch(api("/cliente/descargado"), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ filename: filename || "" }),
+      });
+    } catch {}
+  }
 
-    const resp = await fetch(file.url, { signal });
-    if (!resp.ok) {
-      throw new Error(`HTTP ${resp.status} descargando ${rawName}`);
+  async function reportClientFinalizar() {
+    try {
+      await fetch(api("/cliente/finalizar"), { method: "POST" });
+    } catch {}
+  }
+
+  /* ======================================================
+     📁 Elegir carpeta y crear SIGED_DOCUMENTOS
+  ====================================================== */
+  async function handleChooseFolder() {
+    if (!fsSupported) {
+      setStatus("error");
+      setMsg("Este navegador no soporta selección de carpeta (File System Access API). Use Chrome/Edge.");
+      return;
     }
+    try {
+      const picked = await window.showDirectoryPicker({ mode: "readwrite" });
+      const siged = await ensureSubdirSIGED(picked);
+
+      setRootDirHandle(picked);
+      setSigedDirHandle(siged);
+      setMsg("✅ Carpeta lista: se usará SIGED_DOCUMENTOS dentro de la carpeta que elegiste.");
+    } catch (e) {
+      setStatus("error");
+      setMsg(`No se pudo seleccionar carpeta: ${String(e)}`);
+    }
+  }
+
+  /* ======================================================
+     ⬇️ Descarga (cliente) 1 a 1
+     Estrategia:
+       - Preferido: /proxy (mismo origen) -> evita CORS y no guarda en servidor
+       - Fallback: <a href> (descarga normal; pero SIN carpeta controlada)
+  ====================================================== */
+  async function downloadOneToFolder(file, signal) {
+    if (!sigedDirHandle) {
+      throw new Error("No hay carpeta SIGED_DOCUMENTOS seleccionada.");
+    }
+
+    const name = sanitizeFilename(file?.name || "archivo");
+    const target = api(`/proxy?url=${encodeURIComponent(file.url)}&name=${encodeURIComponent(name)}`);
+
+    const resp = await fetch(target, { signal });
+    if (!resp.ok) throw new Error(`Proxy HTTP ${resp.status}`);
 
     const blob = await resp.blob();
-    const blobUrl = URL.createObjectURL(blob);
-
-    // Descarga invisible
-    const a = document.createElement("a");
-    a.href = blobUrl;
-    a.download = filename;
-    a.style.display = "none";
-    document.body.appendChild(a);
-    a.click();
-
-    // Limpieza
-    setTimeout(() => {
-      try {
-        URL.revokeObjectURL(blobUrl);
-      } catch {}
-      try {
-        document.body.removeChild(a);
-      } catch {}
-    }, 1500);
-
-    return filename;
+    await writeBlobToFile(sigedDirHandle, name, blob);
+    return name;
   }
 
-  /* ======================================================
-     🔁 Loop cliente: descarga secuencial + reporta al backend
-====================================================== */
+  function downloadViaAnchor(file) {
+    const name = sanitizeFilename(file?.name || "archivo");
+    const a = document.createElement("a");
+    a.href = file.url;
+    a.download = name; // puede ser ignorado cross-origin, pero no daña
+    a.rel = "noopener";
+    a.target = "_blank";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    return name;
+  }
+
   async function startClientDownloadLoop() {
     clientLoopStartedRef.current = true;
-    setDownloading(true);
+    setDownloadingClient(true);
+    setMsg("");
 
-    const controller = new AbortController();
-    clientAbortRef.current = controller;
+    clientAbortRef.current = new AbortController();
+    const { signal } = clientAbortRef.current;
 
     try {
-      // Asegurar manifest
-      const manifest = files.length ? files : (await ensureManifestLoaded());
-
-      if (!manifest || manifest.length === 0) {
-        throw new Error("No se pudo obtener la lista de archivos (/archivos).");
+      const manifest = files.length ? files : await ensureManifestLoaded();
+      if (!manifest.length) {
+        setStatus("error");
+        setMsg("No se recibió manifest de archivos (/archivos).");
+        setDownloadingClient(false);
+        return;
       }
 
-      // Si el backend ya tiene client_done > 0 (por reconexión), saltamos esos
-      // Asumimos orden estable (como viene en /archivos).
-      const startIdx = Math.min(clientDone ?? 0, manifest.length);
+      // Si no hay FS API o no eligió carpeta, avisamos y hacemos fallback
+      const canWriteFolder = !!sigedDirHandle;
 
-      for (let i = startIdx; i < manifest.length; i++) {
-        if (controller.signal.aborted) {
-          throw new Error("Cancelado por el usuario.");
-        }
+      if (!canWriteFolder) {
+        // Este mensaje es clave para que no haya “misterios”
+        setMsg(
+          "⚠️ No hay carpeta seleccionada (SIGED_DOCUMENTOS). " +
+            "Haré descargas normales del navegador (sin poder meterlas en carpeta automáticamente). " +
+            "Si querés carpeta real, presioná “Elegir carpeta” (Chrome/Edge) y repetí."
+        );
+      }
 
+      // Descarga secuencial
+      for (let i = 0; i < manifest.length; i++) {
+        if (signal.aborted) break;
         const f = manifest[i];
 
-        // 1) Descargar en cliente
-        const savedName = await downloadOneFile(f, controller.signal);
+        // 2 reintentos por archivo
+        let ok = false;
+        let lastErr = null;
 
-        // 2) Reportar al backend (sube client_done + actualiza last_file + percent)
-        await fetch(api("/cliente/descargado"), {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ filename: savedName }),
-          signal: controller.signal,
-        });
+        for (let attempt = 1; attempt <= 2; attempt++) {
+          try {
+            const savedName = canWriteFolder
+              ? await downloadOneToFolder(f, signal)
+              : downloadViaAnchor(f);
 
-        // pequeño respiro para no saturar
-        await new Promise((r) => setTimeout(r, 80));
+            setLastFile(savedName);
+            await reportClientDownloaded(savedName);
+            ok = true;
+            break;
+          } catch (e) {
+            lastErr = e;
+            // micro pausa
+            await new Promise((r) => setTimeout(r, 350));
+          }
+        }
+
+        if (!ok) {
+          throw new Error(`Error en descarga cliente: ${String(lastErr || "desconocido")}`);
+        }
       }
 
-      // 3) Finalizar en backend (forzar 100% y estado finalizado)
-      await fetch(api("/cliente/finalizar"), {
-        method: "POST",
-        signal: controller.signal,
-      });
-
-      // Refrescar progreso una vez
-      await fetchProgreso();
+      await reportClientFinalizar();
+      setDownloadingClient(false);
     } catch (e) {
-      // Si fue abort explícito, lo consideramos cancelado
-      const msgErr = String(e?.message || e);
-      if (/cancelado/i.test(msgErr) || /aborted/i.test(msgErr)) {
-        setStatus("cancelado");
-        setMsg("");
-      } else {
-        setStatus("error");
-        setMsg(withAdvice(`Error en descarga cliente: ${msgErr}`));
-      }
-    } finally {
-      setDownloading(false);
+      setDownloadingClient(false);
+      setStatus("error");
+      setMsg(withAdvice(`Error en descarga cliente: ${String(e?.message || e)}`));
     }
   }
 
   /* ======================================================
-     🚀 INICIAR (submit del formulario)
+     🚀 INICIAR (submit)
   ====================================================== */
   async function handleDownload(e) {
     e.preventDefault();
@@ -327,9 +362,9 @@ export default function App() {
       return;
     }
 
-    // Reset visual antes de iniciar
-    abortClientDownloads();
+    // Reset UI
     stopPolling();
+    abortClientDownloads();
 
     setStatus("iniciando…");
     setTotal(0);
@@ -348,13 +383,12 @@ export default function App() {
       const data = await res.json();
 
       if (res.ok && data.ok) {
-        // Arrancar polling (el backend pasará por discovery y luego waiting_client)
         setStatus("descubriendo");
         startPolling();
       } else {
         const base = data.detail || data.message || "No se pudo iniciar.";
         const needsAdvice =
-          res.status === 400 ||
+          res.status === 400 || res.status === 404 ||
           /no se encontraron enlaces/i.test(base) ||
           /url inválida|dominio no permitido/i.test(base);
         setStatus("error");
@@ -367,48 +401,24 @@ export default function App() {
   }
 
   /* ======================================================
-     🧹 LIMPIAR (Frontend + Backend)
-     - Limpia UI
-     - Resetea backend para arrancar “limpio”
+     🔁 LIMPIAR
   ====================================================== */
-  async function handleReset() {
-    abortClientDownloads();
+  function handleReset() {
     stopPolling();
-
-    try {
-      await fetch(api("/reset"), { method: "POST" });
-    } catch {}
-
+    abortClientDownloads();
     setStatus("inicio");
     setTotal(0);
     setDiscoveredDone(0);
     setClientDone(0);
     setPercent(0);
     setLastFile("");
-    setFiles([]);
     setUrl("");
     setMsg("");
+    setFiles([]);
   }
 
   /* ======================================================
-     ✋ CANCELAR TODO
-     - Cancela backend (si está corriendo discovery)
-     - Aborta descargas cliente
-  ====================================================== */
-  async function handleCancel() {
-    try {
-      await fetch(api("/cancelar"), { method: "POST" });
-    } catch {}
-    abortClientDownloads();
-    stopPolling();
-    setStatus("cancelado");
-  }
-
-  /* ======================================================
-     🧩 AL MONTAR LA PÁGINA
-     - Si hay un proceso vivo: retomamos polling.
-     - Si estaba esperando cliente: retomamos descarga cliente.
-     - Si no: pantalla limpia.
+     🧩 AL MONTAR
   ====================================================== */
   useEffect(() => {
     let aborted = false;
@@ -419,40 +429,21 @@ export default function App() {
         const data = await res.json();
         if (aborted) return;
 
-        if (data.status === "descubriendo") {
-          setStatus("descubriendo");
-          setTotal(data.total ?? 0);
-          setDiscoveredDone(data.discovered_done ?? 0);
-          setClientDone(data.client_done ?? 0);
-          setPercent(data.percent ?? 0);
-          setLastFile(data.last_file || "");
+        // Si el backend está en medio de discovery o esperando cliente, retomamos polling
+        if (data.status === "descubriendo" || data.status === "esperando_descarga_cliente") {
           startPolling();
-          return;
+        } else {
+          handleReset();
         }
-
-        if (data.status === "esperando_descarga_cliente") {
-          setStatus("descargando_cliente");
-          setTotal(data.total ?? 0);
-          setDiscoveredDone(data.discovered_done ?? 0);
-          setClientDone(data.client_done ?? 0);
-          setPercent(data.percent ?? 0);
-          setLastFile(data.last_file || "");
-          startPolling();
-          // Polling va a disparar startClientDownloadLoop() si no ha iniciado
-          return;
-        }
-
-        // cualquier otro -> limpio
-        await handleReset();
       } catch {
-        await handleReset();
+        handleReset();
       }
     })();
 
     return () => {
       aborted = true;
-      abortClientDownloads();
       stopPolling();
+      abortClientDownloads();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -460,9 +451,10 @@ export default function App() {
   const showCompleted = percent >= 100 || status === "finalizado";
   const inputDisabled =
     status === "descubriendo" ||
+    status === "esperando_descarga_cliente" ||
     status === "descargando_cliente" ||
     status === "iniciando…" ||
-    downloading;
+    downloadingClient;
 
   /* ======================================================
      💅 RENDER
@@ -470,6 +462,25 @@ export default function App() {
   return (
     <div className="container">
       <h1>Módulo de descarga de documentos en el SIGED.</h1>
+
+      <div style={{ marginBottom: 12 }}>
+        <button type="button" onClick={handleChooseFolder} disabled={!fsSupported || inputDisabled}>
+          📁 Elegir carpeta (para crear/usar SIGED_DOCUMENTOS)
+        </button>
+        {!fsSupported ? (
+          <p style={{ marginTop: 6, color: "gray", fontStyle: "italic" }}>
+            Tu navegador no soporta selección de carpeta. Usá Chrome/Edge para guardar dentro de SIGED_DOCUMENTOS.
+          </p>
+        ) : sigedDirHandle ? (
+          <p style={{ marginTop: 6, color: "gray", fontStyle: "italic" }}>
+            ✅ SIGED_DOCUMENTOS listo (se guardará dentro de la carpeta que elegiste).
+          </p>
+        ) : (
+          <p style={{ marginTop: 6, color: "gray", fontStyle: "italic" }}>
+            Recomendado: elegí una carpeta (por ejemplo “Downloads”) y la app creará/usar&aacute; SIGED_DOCUMENTOS.
+          </p>
+        )}
+      </div>
 
       <form onSubmit={handleDownload}>
         <label>🔗 URL del SIGED:</label>
@@ -484,27 +495,11 @@ export default function App() {
         />
         <br />
 
-        <p style={{ fontStyle: "italic", color: "gray" }}>
-          📁 En navegador no se puede crear una carpeta automáticamente.
-          Los archivos se descargarán con prefijo <strong>{DOWNLOAD_PREFIX}</strong> en la carpeta de descargas.
-        </p>
-
         <button type="submit" disabled={inputDisabled}>
-          Iniciar Descarga
+          Iniciar Proceso
         </button>
 
-        {/* Cancelar aparece durante discovery/cliente */}
-        {(status === "descubriendo" || status === "descargando_cliente") && (
-          <>
-            {" "}
-            <button type="button" onClick={handleCancel}>
-              Cancelar
-            </button>
-          </>
-        )}
-
-        {/* Limpiar aparece al finalizar o error/cancel */}
-        {(showCompleted || status === "error" || status === "cancelado") && (
+        {showCompleted && (
           <>
             {" "}
             <button type="button" onClick={handleReset}>
@@ -516,35 +511,22 @@ export default function App() {
 
       <div className="progress-section">
         <p>
-          <strong>Estado:</strong>{" "}
-          {status === "descargando_cliente"
-            ? "descargando (cliente)"
-            : status}
+          <strong>Estado:</strong> {status}
         </p>
-
         {msg && <p style={{ color: "#ffb3b3" }}>{msg}</p>}
 
         <p>
           <strong>Total de documentos:</strong> {total}
         </p>
-
         <p>
-          <strong>Discovery (backend):</strong> {discoveredDone}/{total}
+          <strong>Discovery:</strong> {discoveredDone}/{total} — <strong>Cliente:</strong> {clientDone}/{total}
         </p>
-
-        <p>
-          <strong>Descarga (cliente):</strong> {clientDone}/{total}
-        </p>
-
         <p>
           <strong>Progreso:</strong> {percent}%
         </p>
 
         <div className="progress-bar">
-          <div
-            className="progress-fill"
-            style={{ width: `${Math.min(100, percent)}%` }}
-          />
+          <div className="progress-fill" style={{ width: `${Math.min(100, percent)}%` }} />
         </div>
 
         {lastFile ? (
@@ -555,7 +537,7 @@ export default function App() {
 
         {showCompleted && (
           <p style={{ marginTop: 8 }}>
-            ✅ {total} documentos descargados (prefijo <strong>{DOWNLOAD_PREFIX}</strong>).
+            ✅ Proceso finalizado. (Archivos guardados en <strong>SIGED_DOCUMENTOS</strong> si elegiste carpeta).
           </p>
         )}
       </div>
