@@ -1,49 +1,54 @@
-# ---------- Etapa 1: build del frontend ----------
-FROM node:20-alpine AS fe-build
+# ============================================================
+# STAGE 1 — Build Frontend (Vite)
+# ============================================================
+FROM node:20-alpine AS frontend_builder
 WORKDIR /frontend
 
-# 1) Dependencias de frontend
+# Instala deps con lockfile
 COPY frontend/package*.json ./
 RUN npm ci
 
-# 2) Código y build (mismo origen: VITE_API_BASE vacío)
+# Copia el código y construye dist/
 COPY frontend/ ./
-ENV VITE_API_BASE=
+# Monolítico: NO seteamos VITE_API_BASE => el frontend usará paths relativos (/progreso, /descargar, etc.)
 RUN npm run build
 
-# ---------- Etapa 2: backend con Playwright ----------
-FROM mcr.microsoft.com/playwright/python:v1.46.0-jammy
 
-# Evitar prompts y logs ruidosos
-ENV PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1 \
-    # ruta por defecto de navegadores en la imagen base
-    PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+# ============================================================
+# STAGE 2 — Runtime Backend (FastAPI + Playwright + browsers)
+# ============================================================
+# Esta imagen YA trae browsers + deps del sistema para Playwright
+FROM mcr.microsoft.com/playwright/python:v1.58.0-jammy AS runtime
 
 WORKDIR /app
 
-# 1) Requisitos backend
+# (Opcional pero recomendado) no correr como root en ECS
+# La imagen ya tiene usuario pwuser, lo usamos para seguridad.
+USER root
+
+# Copiamos requirements primero para mejor cache
 COPY backend/requirements.txt /app/requirements.txt
-RUN pip install --no-cache-dir -r /app/requirements.txt \
- && pip install --no-cache-dir "playwright==1.46.0" \
- # Smoke test: confirmamos versión del paquete (no lanza browsers)
- && python - <<'PY'
-import sys, importlib
-m = importlib.import_module("playwright")
-print("Playwright OK:", getattr(m, "__version__", "unknown"), "| Python:", sys.version)
-PY
 
-# 2) Código backend
-COPY backend/app /app/app
+# Instala deps Python
+RUN pip install --no-cache-dir -r /app/requirements.txt
 
-# 3) Estáticos del frontend (ya construidos)
-COPY --from=fe-build /frontend/dist /app/app/public
+# Copia backend completo
+COPY backend/ /app/
 
-# 4) Config de descargas al host (vía volumen)
-ENV SIGED_HEADLESS=1 \
-    SIGED_HOST_DOWNLOADS=/host_downloads
+# Copia build del frontend (dist) a backend/app/public
+# Esto debe calzar con main.py que monta StaticFiles(directory="app/public")
+RUN rm -rf /app/app/public && mkdir -p /app/app/public
+COPY --from=frontend_builder /frontend/dist /app/app/public
 
-EXPOSE 8000
+# Variables runtime
+ENV SIGED_HEADLESS=1
+ENV PYTHONUNBUFFERED=1
 
-# 5) Arranque
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]
+# Puerto interno del container
+EXPOSE 8210
+
+# Cambia a usuario no-root (más seguro)
+USER pwuser
+
+# Uvicorn
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8210"]
